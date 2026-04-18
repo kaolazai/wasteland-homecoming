@@ -1254,8 +1254,13 @@ export class Game {
     setActions(buttons);
   }
 
+  private currentTraderStock: string[] = [];
+
   private handleTraderRoom(room: Room) {
     appendMessage(getRoomDescription(room), 'event');
+    // Generate stock once when entering the trader room
+    this.currentTraderStock = TRADER_STOCK.buy.filter(() => Math.random() < 0.6).slice(0, 5);
+    if (this.currentTraderStock.length === 0) this.currentTraderStock.push('bandage', 'canned_food');
     this.showTraderUI(room, 'buy');
   }
 
@@ -1276,8 +1281,7 @@ export class Game {
     });
 
     if (tab === 'buy') {
-      const stock = TRADER_STOCK.buy.filter(() => Math.random() < 0.6).slice(0, 5);
-      if (stock.length === 0) stock.push('bandage', 'canned_food');
+      const stock = this.currentTraderStock;
 
       for (const itemId of stock) {
         const item = ITEMS[itemId];
