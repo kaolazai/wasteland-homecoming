@@ -1,0 +1,87 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no" />
+  <title>废土归来 | Wasteland Homecoming</title>
+  <link rel="stylesheet" href="/src/style.css" />
+</head>
+<body>
+  <div id="game">
+    <!-- Top: Status Bar -->
+    <header id="status-bar">
+      <div class="status-top">
+        <div class="status-bars">
+          <div class="stat"><span class="label">HP</span><div class="bar"><div id="hp-bar" class="bar-fill hp"></div></div><span id="hp-text">20/20</span></div>
+          <div class="stat"><span class="label">饱食</span><div class="bar"><div id="hunger-bar" class="bar-fill hunger"></div></div><span id="hunger-text">100</span></div>
+        </div>
+        <button id="btn-bag" class="btn-statusbar" title="背包">🎒</button>
+        <button id="btn-home" class="btn-statusbar hidden" title="返回营地">🏠</button>
+      </div>
+      <div class="stat-row2">
+        <span class="tag" id="floor-text">1F</span>
+        <span class="tag gold">💰 <span id="gold-text">0</span></span>
+        <span class="tag atk">⚔️ <span id="atk-text">3</span></span>
+        <span class="tag def">🛡️ <span id="def-text">0</span></span>
+      </div>
+    </header>
+
+    <!-- Map -->
+    <div id="map-container"></div>
+
+    <!-- Combat Screen (hidden by default) -->
+    <div id="combat-screen" class="hidden">
+      <div id="combat-enemy">
+        <div id="enemy-name" class="enemy-name"></div>
+        <div id="enemy-desc" class="enemy-desc"></div>
+        <div class="combat-bar-row">
+          <span class="combat-label">HP</span>
+          <div class="combat-bar"><div id="enemy-hp-bar" class="combat-bar-fill enemy"></div></div>
+          <span id="enemy-hp-text" class="combat-val"></span>
+        </div>
+      </div>
+      <div id="combat-vs">⚔️</div>
+      <div id="combat-player">
+        <div class="combat-bar-row">
+          <span class="combat-label">HP</span>
+          <div class="combat-bar"><div id="combat-player-hp-bar" class="combat-bar-fill player"></div></div>
+          <span id="combat-player-hp-text" class="combat-val"></span>
+        </div>
+      </div>
+      <div id="combat-log"></div>
+      <div id="combat-actions"></div>
+    </div>
+
+    <!-- Inventory Screen (hidden by default) -->
+    <div id="inventory-screen" class="hidden">
+      <div id="inv-header">
+        <span id="inv-title">🎒 背包</span>
+        <span id="inv-slots">0/16</span>
+      </div>
+      <div id="inv-equip">
+        <div id="inv-weapon" class="inv-equip-slot">
+          <span class="inv-equip-label">⚔️</span>
+          <span class="inv-equip-name">空手</span>
+        </div>
+        <div id="inv-armor" class="inv-equip-slot">
+          <span class="inv-equip-label">🛡️</span>
+          <span class="inv-equip-name">无</span>
+        </div>
+      </div>
+      <div id="inv-grid"></div>
+      <div id="inv-detail"></div>
+      <div id="inv-actions"></div>
+    </div>
+
+    <!-- Middle: Story / Scene -->
+    <main id="scene">
+      <div id="scene-log"></div>
+    </main>
+
+    <!-- Bottom: Actions -->
+    <footer id="actions"></footer>
+  </div>
+
+  <script type="module" src="/src/main.ts"></script>
+</body>
+</html>
