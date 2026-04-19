@@ -144,6 +144,10 @@ html, body {
 .tag.gold { color: #ccaa33; }
 .tag.atk { color: #cc6644; border-color: #2a1a1a; background: #1a0a0a; }
 .tag.def { color: #4488cc; border-color: #1a1a2a; background: #0a0a1a; }
+.tag.day { color: #88aacc; border-color: #1a1a2a; background: #0a0a1a; }
+.tag.karma-neutral { color: #999; }
+.tag.karma-good { color: #66cc99; border-color: #1a2a1a; background: #0a1a0a; }
+.tag.karma-evil { color: #cc6699; border-color: #2a1a1a; background: #1a0a0a; }
 
 /* === Map === */
 #map-container {
@@ -394,10 +398,59 @@ html, body {
   background: #0e0a08;
 }
 
-#combat-player {
+#combat-party-bars {
   padding: 10px 20px;
   background: linear-gradient(180deg, #0a1a0a 0%, #0c0808 100%);
   border-bottom: 1px solid #1a2a1a;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.party-bar-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.party-bar-row .member-name {
+  font-size: 11px;
+  color: #88aa88;
+  min-width: 42px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.party-bar-row .member-name.dead {
+  color: #666;
+  text-decoration: line-through;
+}
+
+.party-bar-row .member-name.active {
+  color: #aaeeaa;
+  font-weight: 700;
+}
+
+.party-bar-row .member-mp {
+  font-size: 10px;
+  color: #6688cc;
+  min-width: 30px;
+  text-align: right;
+}
+
+#combat-turn-order {
+  padding: 4px 20px;
+  background: #0e0a08;
+  font-size: 11px;
+  color: #665544;
+  border-bottom: 1px solid #1a1510;
+}
+
+#enemy-bars {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
 }
 
 #combat-log {

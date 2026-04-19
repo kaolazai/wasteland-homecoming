@@ -21,6 +21,8 @@ export interface Outcome {
   item?: string;
   combat?: string;
   mutation?: MutationType;
+  /** Karma change from this choice (-100 to +100 range) */
+  karma?: number;
   /** Delayed effect triggers N floors later */
   delayed?: { floorsLater: number; text: string; hp?: number; hunger?: number; gold?: number; mutation?: MutationType };
 }
@@ -59,8 +61,8 @@ export const EXPLORE_EVENTS: GameEvent[] = [
     id: 'survivor',
     text: '一个衣衫褴褛的幸存者蹲在角落，看到你后露出警惕的眼神。',
     choices: [
-      { text: '🤝 友好交谈', outcome: { text: '"谢谢你没有攻击我……"他给了你一些物资作为谢礼。', gold: 12, hunger: 10 } },
-      { text: '🔪 威胁搜身', outcome: { text: '他挣扎着跑掉了，地上掉落了一些东西。', gold: 6 } },
+      { text: '🤝 友好交谈', outcome: { text: '"谢谢你没有攻击我……"他给了你一些物资作为谢礼。', gold: 12, hunger: 10, karma: 5 } },
+      { text: '🔪 威胁搜身', outcome: { text: '他挣扎着跑掉了，地上掉落了一些东西。', gold: 6, karma: -10 } },
       { text: '🚶 无视走开', outcome: { text: '你没有理会他，继续前进。' } },
     ],
   },
@@ -104,8 +106,8 @@ export const EXPLORE_EVENTS: GameEvent[] = [
     id: 'wounded_animal',
     text: '一只受伤的野猫蜷缩在纸箱里，用恐惧的眼睛看着你。',
     choices: [
-      { text: '💊 治疗它', outcome: { text: '你包扎了它的伤口。你心情好了一些。', hp: 3, hunger: -5 } },
-      { text: '🍖 ……', outcome: { text: '你做了一个艰难的决定。至少不会挨饿了。', hunger: 30 } },
+      { text: '💊 治疗它', outcome: { text: '你包扎了它的伤口。你心情好了一些。', hp: 3, hunger: -5, karma: 5 } },
+      { text: '🍖 ……', outcome: { text: '你做了一个艰难的决定。至少不会挨饿了。', hunger: 30, karma: -5 } },
       { text: '🚶 走开', outcome: { text: '你叹了口气，继续赶路。' } },
     ],
   },
@@ -132,7 +134,7 @@ export const EXPLORE_EVENTS: GameEvent[] = [
     text: '你拐过一个弯，突然被人从背后扼住——"别动，把值钱的东西交出来！"',
     choices: [
       { text: '🗡️ 反击', outcome: { text: '你肘击对方腹部，扭打在一起！', combat: 'bandit' } },
-      { text: '💰 交出财物', outcome: { text: '你交出了一些钱财，对方推开你跑掉了。', gold: -15 } },
+      { text: '💰 交出财物', outcome: { text: '你交出了一些钱财，对方推开你跑掉了。', gold: -15, karma: 3 } },
       { text: '🗣️ 大喊求救', outcome: { text: '你的喊声吓跑了对方。' } },
     ],
     minFloor: 2,
@@ -190,8 +192,8 @@ export const EXPLORE_EVENTS: GameEvent[] = [
     id: 'corpse',
     text: '地上躺着一具已经风干的尸体，身上还有一个背包。',
     choices: [
-      { text: '🎒 搜索背包', outcome: { text: '背包里有一些有用的东西。逝者安息。', gold: 10, item: 'canned_food' } },
-      { text: '🙏 默哀后离开', outcome: { text: '你向逝者致以敬意，继续前行。', hp: 1 } },
+      { text: '🎒 搜索背包', outcome: { text: '背包里有一些有用的东西。逝者安息。', gold: 10, item: 'canned_food', karma: -3 } },
+      { text: '🙏 默哀后离开', outcome: { text: '你向逝者致以敬意，继续前行。', hp: 1, karma: 3 } },
     ],
   },
   {
@@ -278,6 +280,50 @@ export const EXPLORE_EVENTS: GameEvent[] = [
       { text: '🍎 吃一颗', outcome: { text: '果肉甘甜多汁，你感到前所未有的精力充沛！', hp: 10, hunger: 20, delayed: { floorsLater: 2, text: '那颗果实的效力开始显现……你的指尖开始渗出绿色的汁液，身体正在发生变异。', mutation: 'regen' } } },
       { text: '🎒 带走几颗', outcome: { text: '你摘了几颗放进包里，小心翼翼。', item: 'energy_drink' } },
       { text: '🚫 发光的东西不能吃', outcome: { text: '生存法则第一条：不吃任何发光的东西。你走了。' } },
+    ],
+    minFloor: 3,
+    weight: 4,
+  },
+  // === KARMA / MORAL DILEMMA EVENTS ===
+  {
+    id: 'trapped_survivor',
+    text: '废墟下传来微弱的呼救声。一个幸存者被倒塌的梁柱压住了腿，身边散落着不少物资。',
+    choices: [
+      { text: '💪 全力营救', outcome: { text: '你费了九牛二虎之力把他救了出来。"谢谢你……拿着这些，你比我更需要。"', gold: 5, hp: -3, karma: 15 } },
+      { text: '🎒 拿走物资离开', outcome: { text: '你默默拿走了散落的物资。身后的呼救声渐渐微弱……', gold: 25, item: 'medkit', karma: -20 } },
+      { text: '🚶 假装没听到', outcome: { text: '你加快脚步，不敢回头。', karma: -5 } },
+    ],
+    minFloor: 2,
+    weight: 5,
+  },
+  {
+    id: 'starving_child',
+    text: '一个瘦弱的孩子缩在角落，饿得发抖。他用期盼的眼神看着你。',
+    choices: [
+      { text: '🍞 分享食物', outcome: { text: '你把一些食物分给了他。他狼吞虎咽地吃着，眼里含着泪。', hunger: -15, karma: 10 } },
+      { text: '📍 告诉他营地的位置', outcome: { text: '"往南走，有个营地。"孩子点点头，踉跄着跑走了。', karma: 8 } },
+      { text: '🚶 继续赶路', outcome: { text: '你别过脸，继续走。这个世界容不下太多善良。', karma: -3 } },
+    ],
+    weight: 5,
+  },
+  {
+    id: 'merchant_robbery',
+    text: '你发现几个人正在围殴一个商人，抢夺他的货物。',
+    choices: [
+      { text: '🗡️ 挺身而出', outcome: { text: '你冲上去赶跑了劫匪。商人感激涕零，把一些货物送给了你。', gold: 10, item: 'bandage', hp: -5, karma: 15 } },
+      { text: '👀 趁乱捡便宜', outcome: { text: '你趁他们打得不可开交，悄悄捡走了地上的货物。', gold: 20, karma: -10 } },
+      { text: '🔙 不想惹事', outcome: { text: '你悄悄绕道走开了。', karma: -2 } },
+    ],
+    minFloor: 2,
+    weight: 5,
+  },
+  {
+    id: 'poisoned_water_supply',
+    text: '你发现有人在一处公共水源里投毒。你认出了那个人——他想独占这片区域的资源。',
+    choices: [
+      { text: '🚫 阻止他', outcome: { text: '你制止了他的行为。他恼羞成怒向你挥拳，但被你打跑了。', hp: -4, karma: 15 } },
+      { text: '🤝 索要分成', outcome: { text: '"给我一份，我就不管。"他丢给你一些物资。', gold: 15, karma: -15 } },
+      { text: '🔙 别管闲事', outcome: { text: '你默默离开了。', karma: -5 } },
     ],
     minFloor: 3,
     weight: 4,

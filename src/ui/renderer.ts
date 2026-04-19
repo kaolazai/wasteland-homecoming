@@ -1,4 +1,4 @@
-import type { PlayerState, InventoryItem } from '../core/state';
+import type { GameState, InventoryItem } from '../core/state';
 import type { FloorMap } from '../data/maps';
 import { ITEMS } from '../data/items';
 import { ENEMIES } from '../data/events';
@@ -10,12 +10,15 @@ const sceneLog = document.getElementById('scene-log')!;
 const actionsEl = document.getElementById('actions')!;
 const hpBar = document.getElementById('hp-bar')!;
 const hpText = document.getElementById('hp-text')!;
-const hungerBar = document.getElementById('hunger-bar')!;
-const hungerText = document.getElementById('hunger-text')!;
+const staminaBar = document.getElementById('stamina-bar')!;
+const staminaText = document.getElementById('stamina-text')!;
 const floorText = document.getElementById('floor-text')!;
 const goldText = document.getElementById('gold-text')!;
 const atkText = document.getElementById('atk-text')!;
 const defText = document.getElementById('def-text')!;
+const dayText = document.getElementById('day-text')!;
+const karmaText = document.getElementById('karma-text')!;
+const karmaTag = document.getElementById('karma-tag')!;
 const mapContainer = document.getElementById('map-container')!;
 
 let btnHome = document.getElementById('btn-home')!;
@@ -70,24 +73,31 @@ export function showConfirm(message: string, onYes: () => void): void {
   });
 }
 
-export function updateStatusBar(state: PlayerState): void {
-  const hpPct = Math.max(0, (state.hp / state.maxHp) * 100);
+export function updateStatusBar(state: GameState): void {
+  const p = state.party[0];
+  const hpPct = Math.max(0, (p.hp / p.maxHp) * 100);
   hpBar.style.width = hpPct + '%';
   hpBar.style.background = hpPct > 50 ? 'var(--hp)' : hpPct > 25 ? '#aaaa33' : 'var(--danger)';
-  hpText.textContent = `${state.hp}/${state.maxHp}`;
+  hpText.textContent = `${p.hp}/${p.maxHp}`;
 
-  const hungerPct = Math.max(0, (state.hunger / state.maxHunger) * 100);
-  hungerBar.style.width = hungerPct + '%';
-  hungerBar.style.background = hungerPct > 30 ? 'var(--hunger)' : 'var(--danger)';
-  hungerText.textContent = `${state.hunger}`;
+  const staminaPct = Math.max(0, (state.stamina / state.maxStamina) * 100);
+  staminaBar.style.width = staminaPct + '%';
+  staminaBar.style.background = staminaPct > 30 ? 'var(--hunger)' : 'var(--danger)';
+  staminaText.textContent = `${state.stamina}`;
 
   floorText.textContent = `${state.floor}F`;
   goldText.textContent = `${state.gold}`;
+  dayText.textContent = `${state.day}`;
 
   const atk = getAttack(state, ITEMS);
   const def = getDefense(state, ITEMS);
   atkText.textContent = `${atk}`;
   defText.textContent = `${def}`;
+
+  // Karma display
+  const k = state.karma;
+  karmaText.textContent = `${k}`;
+  karmaTag.className = k > 20 ? 'tag karma-good' : k < -20 ? 'tag karma-evil' : 'tag karma-neutral';
 }
 
 export type MsgType = 'narrator' | 'event' | 'combat' | 'loot' | 'system' | 'divider';
@@ -230,12 +240,18 @@ const combatScreen = document.getElementById('combat-screen')!;
 const sceneEl = document.getElementById('scene')!;
 const enemyNameEl = document.getElementById('enemy-name')!;
 const enemyDescEl = document.getElementById('enemy-desc')!;
-const enemyHpBar = document.getElementById('enemy-hp-bar')!;
-const enemyHpText = document.getElementById('enemy-hp-text')!;
-const combatPlayerHpBar = document.getElementById('combat-player-hp-bar')!;
-const combatPlayerHpText = document.getElementById('combat-player-hp-text')!;
+const enemyBarsEl = document.getElementById('enemy-bars')!;
+const combatPartyBarsEl = document.getElementById('combat-party-bars')!;
+const combatTurnOrderEl = document.getElementById('combat-turn-order')!;
 const combatLog = document.getElementById('combat-log')!;
 const combatActionsEl = document.getElementById('combat-actions')!;
+
+export interface CombatEnemy {
+  id: string;
+  name: string;
+  currentHp: number;
+  maxHp: number;
+}
 
 export function showCombatScreen(enemyName: string, enemyDesc: string): void {
   hideMap();
@@ -253,22 +269,59 @@ export function hideCombatScreen(): void {
   actionsEl.classList.remove('hidden');
 }
 
+/** Render enemy HP bars (supports multiple enemies) */
+export function updateEnemyBars(enemies: CombatEnemy[]): void {
+  enemyBarsEl.innerHTML = '';
+  for (const e of enemies) {
+    const pct = Math.max(0, (e.currentHp / e.maxHp) * 100);
+    const row = document.createElement('div');
+    row.className = 'combat-bar-row';
+    row.innerHTML = `
+      <span class="combat-label">${enemies.length > 1 ? e.name : 'HP'}</span>
+      <div class="combat-bar"><div class="combat-bar-fill enemy" style="width:${pct}%"></div></div>
+      <span class="combat-val">${Math.max(0, e.currentHp)} / ${e.maxHp}</span>`;
+    enemyBarsEl.appendChild(row);
+  }
+}
+
+/** Render party HP/MP bars */
+export function updatePartyBars(
+  party: Array<{ name: string; hp: number; maxHp: number; mp: number; maxMp: number; isAlive: boolean }>,
+  activeIdx?: number,
+): void {
+  combatPartyBarsEl.innerHTML = '';
+  for (let i = 0; i < party.length; i++) {
+    const m = party[i];
+    const hpPct = Math.max(0, (m.hp / m.maxHp) * 100);
+    const row = document.createElement('div');
+    row.className = 'party-bar-row';
+    const nameClass = !m.isAlive ? 'member-name dead' : i === activeIdx ? 'member-name active' : 'member-name';
+    const barBg = hpPct > 50
+      ? 'linear-gradient(90deg, #338833, #44aa44)'
+      : hpPct > 25
+        ? 'linear-gradient(90deg, #888833, #aaaa44)'
+        : 'linear-gradient(90deg, #883333, #aa4444)';
+    row.innerHTML = `
+      <span class="${nameClass}">${m.name}</span>
+      <div class="combat-bar"><div class="combat-bar-fill player" style="width:${hpPct}%;background:${barBg}"></div></div>
+      <span class="combat-val">${Math.max(0, m.hp)}/${m.maxHp}</span>
+      <span class="member-mp">MP${m.mp}</span>`;
+    combatPartyBarsEl.appendChild(row);
+  }
+}
+
+/** Show turn order indicator */
+export function updateTurnOrder(names: string[], currentIdx: number): void {
+  combatTurnOrderEl.textContent = '行动序: ' + names.map((n, i) => i === currentIdx ? `[${n}]` : n).join(' → ');
+}
+
+/** Legacy compat: update single enemy + single player bars */
 export function updateCombatBars(
   enemyHp: number, enemyMaxHp: number,
   playerHp: number, playerMaxHp: number,
 ): void {
-  const ePct = Math.max(0, (enemyHp / enemyMaxHp) * 100);
-  enemyHpBar.style.width = ePct + '%';
-  enemyHpText.textContent = `${enemyHp} / ${enemyMaxHp}`;
-
-  const pPct = Math.max(0, (playerHp / playerMaxHp) * 100);
-  combatPlayerHpBar.style.width = pPct + '%';
-  combatPlayerHpBar.style.background = pPct > 50
-    ? 'linear-gradient(90deg, #338833, #44aa44)'
-    : pPct > 25
-      ? 'linear-gradient(90deg, #888833, #aaaa44)'
-      : 'linear-gradient(90deg, #883333, #aa4444)';
-  combatPlayerHpText.textContent = `${playerHp} / ${playerMaxHp}`;
+  updateEnemyBars([{ id: '_', name: 'HP', currentHp: enemyHp, maxHp: enemyMaxHp }]);
+  updatePartyBars([{ name: '幸存者', hp: playerHp, maxHp: playerMaxHp, mp: 0, maxMp: 0, isAlive: playerHp > 0 }]);
 }
 
 export type CombatMsgType = 'atk-player' | 'atk-enemy' | 'info' | 'result';
@@ -319,7 +372,7 @@ const invGridEl = document.getElementById('inv-grid')!;
 const invDetailEl = document.getElementById('inv-detail')!;
 const invActionsEl = document.getElementById('inv-actions')!;
 
-export function showInventoryScreen(state: PlayerState): void {
+export function showInventoryScreen(state: GameState): void {
   hideMap();
   sceneEl.classList.add('hidden');
   actionsEl.classList.add('hidden');
@@ -349,7 +402,7 @@ export function hideInventoryScreen(): void {
 }
 
 export function renderInventoryGrid(
-  state: PlayerState,
+  state: GameState,
   onSlotClick: (itemId: string) => void,
   selectedItemId?: string,
 ): void {

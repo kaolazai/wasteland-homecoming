@@ -30,6 +30,10 @@ export interface ItemDef {
   /** For consumable */
   hpRestore?: number;
   hungerRestore?: number;
+  /** Combat damage when used as item in battle (e.g. EMP grenade) */
+  combatDamage?: number;
+  /** Bonus damage vs mechanical enemies */
+  combatDamageMech?: number;
   /** Sell price */
   price: number;
 }
@@ -83,7 +87,7 @@ export const ITEMS: Record<string, ItemDef> = {
   // === Crafting Exclusives ===
   rad_suit: { id: 'rad_suit', name: '防辐射服', icon: '🥼', type: 'armor', desc: '用化学品处理过的防护服，能有效隔绝辐射伤害。', defense: 6, price: 0 },
   stim_shot: { id: 'stim_shot', name: '兴奋剂', icon: '💉', type: 'consumable', desc: '一针下去精神百倍！恢复HP和饱食。', hpRestore: 15, hungerRestore: 25, price: 0 },
-  emp_grenade: { id: 'emp_grenade', name: 'EMP手雷', icon: '💣', type: 'consumable', desc: '电磁脉冲手雷，对机械敌人造成巨大伤害。使用后对当前敌人造成20点伤害。', price: 0 },
+  emp_grenade: { id: 'emp_grenade', name: 'EMP手雷', icon: '💣', type: 'consumable', desc: '电磁脉冲手雷，对机械敌人造成巨大伤害。使用后对当前敌人造成20点伤害（机械+30）。', combatDamage: 20, combatDamageMech: 30, price: 0 },
   hardened_blade: { id: 'hardened_blade', name: '淬火长刀', icon: '⚔️', type: 'weapon', desc: '用化学品淬火的长刀，锋利无比。', attack: 11, price: 0 },
   survival_kit: { id: 'survival_kit', name: '生存工具包', icon: '🧰', type: 'consumable', desc: '全能工具包，恢复大量HP和饱食度。', hpRestore: 25, hungerRestore: 40, price: 0 },
 

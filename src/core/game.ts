@@ -1,5 +1,5 @@
 import {
-  PlayerState, createInitialState, saveState, loadState, clearSave,
+  GameState, type PartyMember, createInitialState, createInitialGameState, saveState, loadState, clearSave,
   getAttack, getDefense, applyDefense, calcDamageTaken, getHungerMultiplier, type InventoryItem,
   canUseConsumables, canEscape, getEscapeChance,
   applyMutation, clearMutation, MUTATIONS,
@@ -11,7 +11,8 @@ import {
 } from './state';
 import {
   updateStatusBar, appendMessage, clearMessages, setActions, renderMap, hideMap,
-  showCombatScreen, hideCombatScreen, updateCombatBars, appendCombatMsg, setCombatActions,
+  showCombatScreen, hideCombatScreen, updateCombatBars, updateEnemyBars, updatePartyBars, updateTurnOrder,
+  appendCombatMsg, setCombatActions,
   showInventoryScreen, hideInventoryScreen, renderInventoryGrid,
   setInventoryDetail, setInventoryActions,
   showHomeButton, hideHomeButton, setBagButtonCallback, showConfirm,
@@ -25,11 +26,15 @@ import {
   type Outcome, type EnemyData, type EnemyAbility,
 } from '../data/events';
 import { ITEMS, rollLoot, rollAffix, LOOT_TABLES, AFFIXES, type WeaponAffix } from '../data/items';
+import { WORLD_NODES, type WorldNode } from '../data/nodes';
 import { generateFloorMap, getRoomDescription, type FloorMap, type Room } from '../data/maps';
 import { RECIPES, STARTER_RECIPES } from '../data/recipes';
 import { JOURNAL_ENTRIES, NPCS, NPC_QUESTS, STORY_EVENTS, CAMP_SHOP_STOCK, PREMIUM_SHOP_POOL, type NpcDef } from '../data/journal';
-import { SKILLS, POINT_SKILLS, EXPLORATION_SKILLS, type SkillEffect } from '../data/skills';
+import { SKILLS, POINT_SKILLS, EXPLORATION_SKILLS, JOB_SKILLS, type SkillEffect } from '../data/skills';
+import { JOBS, type JobDef } from '../data/jobs';
+import { LORE_FRAGMENTS, PUZZLES, BOSS_WEAKNESSES } from '../data/lore';
 import { ACHIEVEMENTS, type AchievementStats } from '../data/achievements';
+import { COMPANIONS } from '../data/companions';
 
 function rand(min: number, max: number): number {
   return Math.floor(Math.random() * (max - min + 1)) + min;
@@ -49,7 +54,7 @@ interface RunStats {
 }
 
 export class Game {
-  state: PlayerState;
+  state: GameState;
   private runStats: RunStats | null = null;
 
   constructor() {
@@ -62,10 +67,14 @@ export class Game {
     hideMap();
 
     if (this.state.map) {
-      showHomeButton(() => this.returnToBase());
+      showHomeButton(() => { this.state.currentNodeId = 'camp'; this.returnToBase(); });
       appendMessage('—— 废 土 归 来 ——', 'system');
       appendMessage('你从短暂的休息中醒来，继续探索……', 'narrator');
       this.showMapView();
+    } else if (this.state.currentNodeId && this.state.currentNodeId !== 'camp') {
+      appendMessage('—— 废 土 归 来 ——', 'system');
+      appendMessage('你回到了之前的位置……', 'narrator');
+      this.showWorldMap();
     } else {
       appendMessage('—— 废 土 归 来 ——', 'system');
       appendMessage('文明崩塌后的第147天。', 'narrator');
@@ -114,13 +123,13 @@ export class Game {
     const mealCost = Math.max(3, 8 - kitchenLv);
 
     const actions: ActionButton[] = [
-      { text: '🏚️ 出发探索', primary: true, callback: () => this.enterDungeon() },
+      { text: '🗺️ 出发探索', primary: true, callback: () => this.showWorldMap() },
       ...(this.state.endlessUnlocked ? [{
         text: `♾️ 无尽模式 (最高${this.state.endlessHighFloor}F)`,
         callback: () => this.enterEndless(),
       }] : []),
-      { text: '😴 休息', disabled: this.state.hp >= this.state.maxHp, callback: () => this.rest() },
-      { text: `🍖 吃饭 (${mealCost}💰)`, disabled: this.state.hunger >= this.state.maxHunger || this.state.gold < mealCost, callback: () => this.eat() },
+      { text: '😴 休息 (天数+1)', disabled: this.state.party[0].hp >= this.state.party[0].maxHp && this.state.stamina >= this.state.maxStamina, callback: () => this.rest() },
+      { text: `🍖 吃饭 (${mealCost}💰)`, disabled: this.state.stamina >= this.state.maxStamina || this.state.gold < mealCost, callback: () => this.eat() },
       { text: '🔨 建筑升级', callback: () => this.showBuildingsMenu() },
     ];
 
@@ -142,16 +151,24 @@ export class Game {
       }
     }
 
-    // Skills
+    // Jobs & Skills
+    actions.push({
+      text: `🎭 职业转换`,
+      callback: () => this.showJobMenu(),
+    });
     actions.push({
       text: `⚡ 技能${this.state.skillPoints > 0 ? ` (${this.state.skillPoints}点可用)` : ''}`,
       callback: () => this.showSkillsPage(),
     });
 
-    // Journal
-    if (this.state.journalEntries.length > 0) {
-      actions.push({ text: '📜 记录', callback: () => this.showJournal() });
+    // Literature & Journal
+    if (this.state.journalEntries.length > 0 || this.state.collectedLore.length > 0) {
+      actions.push({ text: '📜 文献/记录', callback: () => this.showLiteratureMenu() });
     }
+
+    // Karma status
+    const karmaLabel = this.state.karma > 20 ? '善' : this.state.karma < -20 ? '恶' : '中立';
+    actions.push({ text: `⚖️ 因果 (${this.state.karma} · ${karmaLabel})`, callback: () => this.showKarmaStatus() });
 
     actions.push({ text: '🏅 成就', callback: () => this.showAchievements() });
     actions.push({ text: '💾 存档', callback: () => this.showSaveManager() });
@@ -169,7 +186,7 @@ export class Game {
     const buildings: { key: BuildingKey; icon: string; name: string; maxLv: number; costs: number[]; unlock: number; desc: string; effectPerLevel: string }[] = [
       { key: 'armory', icon: '⚔️', name: '武器库', maxLv: 5, costs: [30,60,100,150,200], unlock: 0, desc: '强化武器装备', effectPerLevel: '基础攻击力 +2' },
       { key: 'shelter', icon: '🛖', name: '避难所', maxLv: 5, costs: [30,60,100,150,200], unlock: 0, desc: '加固营地防御', effectPerLevel: '最大HP +5' },
-      { key: 'kitchen', icon: '🍳', name: '厨房', maxLv: 5, costs: [30,60,100,150,200], unlock: 0, desc: '改善伙食条件', effectPerLevel: '最大饱食 +15' },
+      { key: 'kitchen', icon: '🍳', name: '厨房', maxLv: 5, costs: [30,60,100,150,200], unlock: 0, desc: '改善伙食条件', effectPerLevel: '最大体力 +15' },
       { key: 'warehouse', icon: '🗄️', name: '仓库', maxLv: 3, costs: [60,120,240], unlock: 2, desc: '扩大存储空间', effectPerLevel: '背包 +4格' },
       { key: 'workbench', icon: '🔬', name: '工作台', maxLv: 3, costs: [80,160,300], unlock: 3, desc: '制作物品', effectPerLevel: '解锁更高级配方' },
       { key: 'clinic', icon: '🏥', name: '医疗站', maxLv: 3, costs: [80,160,300], unlock: 3, desc: '医疗设施', effectPerLevel: '休息回复量翻倍' },
@@ -222,15 +239,17 @@ export class Game {
         appendMessage(`⚔️ 基础攻击力 +2`, 'system');
         break;
       case 'kitchen':
-        this.state.maxHunger += 15;
-        this.state.hunger = Math.min(this.state.hunger + 15, this.state.maxHunger);
-        appendMessage(`🍖 最大饱食度 +15`, 'system');
+        this.state.maxStamina += 15;
+        this.state.stamina = Math.min(this.state.stamina + 15, this.state.maxStamina);
+        appendMessage(`🍖 最大体力度 +15`, 'system');
         break;
-      case 'shelter':
-        this.state.maxHpBase += 5;
-        this.state.maxHp = this.state.maxHpBase + this.state.baseLevel.shelter * 5;
-        this.state.hp = Math.min(this.state.hp + 5, this.state.maxHp);
+      case 'shelter': {
+        // FIX C1: recalculate from clean base, no double-counting
+        const newMaxHp = this.state.maxHpBase + this.state.baseLevel.shelter * 5;
+        this.state.party[0].maxHp = newMaxHp;
+        this.state.party[0].hp = Math.min(this.state.party[0].hp + 5, this.state.party[0].maxHp);
         appendMessage(`❤️ 最大生命 +5`, 'system');
+      }
         break;
       case 'warehouse':
         this.state.inventorySlots = calcInventorySlots(this.state);
@@ -255,15 +274,71 @@ export class Game {
   }
 
   private rest() {
+    // Advance day
+    this.state.day++;
+    // Full stamina restore
+    this.state.stamina = this.state.maxStamina;
     // Clinic multiplier: base heal * (1 + clinic level)
     const clinicBonus = 1 + this.state.baseLevel.clinic;
     const heal = (5 + this.state.baseLevel.shelter * 3) * clinicBonus;
-    this.state.hp = Math.min(this.state.maxHp, this.state.hp + heal);
-    appendMessage(`你休息了一会儿。❤️ +${heal} HP`, 'narrator');
+    // Heal all alive party members
+    for (const m of this.state.party) {
+      if (m.isAlive) {
+        m.hp = Math.min(m.maxHp, m.hp + heal);
+        m.mp = m.maxMp; // Full MP restore on rest
+      }
+    }
+    // Revive fallen members at 1 HP
+    for (const m of this.state.party) {
+      if (!m.isAlive) {
+        m.isAlive = true;
+        m.hp = 1;
+        appendMessage(`${m.name} 恢复了意识 (1 HP)`, 'loot');
+      }
+    }
+    appendMessage(`夜幕降临，你休息了一晚。⏰ 第${this.state.day}天`, 'narrator');
+    appendMessage(`❤️ 全员 +${heal} HP | 🍖 体力恢复满 | 💎 MP恢复满`, 'loot');
     if (this.state.baseLevel.clinic > 0) {
       appendMessage(`🏥 医疗站效果：回复量 x${clinicBonus}`, 'system');
     }
+    // Check day-based unlocks
+    this.refreshNodeUnlocks();
+    const newUnlocks = Object.values(WORLD_NODES).filter(n =>
+      n.unlockCondition.type === 'day' &&
+      this.state.day >= (n.unlockCondition.value as number) &&
+      !this.state.unlockedNodeIds.includes(n.id)
+    );
+    for (const n of newUnlocks) {
+      this.state.unlockedNodeIds.push(n.id);
+      appendMessage(`🗺️ 新地点已解锁：${n.icon} ${n.name}`, 'event');
+    }
+    // Day-threshold companion recruitment (old_chen)
+    for (const comp of Object.values(COMPANIONS)) {
+      if (comp.recruitCondition.type === 'day_threshold' && this.state.day >= (comp.recruitCondition.value as number)) {
+        const alreadyHave = this.state.party.some(m => m.id === comp.id) || this.state.companions.some(m => m.id === comp.id);
+        if (!alreadyHave) {
+          const member: PartyMember = {
+            id: comp.id, companionId: comp.id, name: comp.name, level: 1, exp: 0,
+            hp: comp.baseStats.hp, maxHp: comp.baseStats.hp,
+            mp: comp.baseStats.mp, maxMp: comp.baseStats.mp,
+            baseAttack: comp.baseStats.attack, baseDefense: comp.baseStats.defense, speed: comp.baseStats.speed,
+            currentJobId: comp.defaultJobId, jobLevels: { [comp.defaultJobId]: 1 }, sp: 0,
+            equipment: { weapon: null, armor: null, accessory: null },
+            learnedSkills: [], equippedSkills: [], statusEffects: [], isAlive: true,
+          };
+          if (this.state.party.length < 4) {
+            this.state.party.push(member);
+            appendMessage(`${comp.icon} ${comp.name}来到了营地，加入了队伍！`, 'loot');
+          } else {
+            this.state.companions.push(member);
+            appendMessage(`${comp.icon} ${comp.name}来到了营地！（后备队伍）`, 'loot');
+          }
+          appendMessage(`  "${comp.desc}"`, 'narrator');
+        }
+      }
+    }
     updateStatusBar(this.state);
+    saveState(this.state);
     this.showBaseActions();
   }
 
@@ -273,8 +348,8 @@ export class Game {
     const restore = 30 + kitchenLv * 10;
     const cost = Math.max(3, 8 - kitchenLv);
     this.state.gold -= cost;
-    this.state.hunger = Math.min(this.state.maxHunger, this.state.hunger + restore);
-    appendMessage(`你吃了一顿饭。🍖 +${restore} 饱食 (${cost}💰)`, 'narrator');
+    this.state.stamina = Math.min(this.state.maxStamina, this.state.stamina + restore);
+    appendMessage(`你吃了一顿饭。🍖 +${restore} 体力 (${cost}💰)`, 'narrator');
     if (kitchenLv > 0) {
       appendMessage(`🍳 厨房 Lv.${kitchenLv}：饭菜更丰盛了`, 'system');
     }
@@ -351,7 +426,7 @@ export class Game {
     if (def.type === 'consumable') {
       const parts: string[] = [];
       if (def.hpRestore) parts.push(`HP+${def.hpRestore}`);
-      if (def.hungerRestore) parts.push(def.hungerRestore > 0 ? `饱食+${def.hungerRestore}` : `饱食${def.hungerRestore}`);
+      if (def.hungerRestore) parts.push(def.hungerRestore > 0 ? `体力+${def.hungerRestore}` : `体力${def.hungerRestore}`);
       return parts.join(' ') || def.desc;
     }
     return def.desc;
@@ -471,7 +546,7 @@ export class Game {
       }
     }
     if (dialogue.hp) {
-      this.state.hp = Math.min(this.state.maxHp, this.state.hp + dialogue.hp);
+      this.state.party[0].hp = Math.min(this.state.party[0].maxHp, this.state.party[0].hp + dialogue.hp);
       appendMessage(`❤️ +${dialogue.hp} HP`, 'loot');
     }
     if (dialogue.item) {
@@ -640,6 +715,209 @@ export class Game {
       }
     }
 
+    setActions([{ text: '🔙 返回', callback: () => { clearMessages(); this.showLiteratureMenu(); } }]);
+  }
+
+  // === Literature & Puzzle System (Phase 7) ===
+
+  private showLiteratureMenu() {
+    clearMessages();
+    const loreCount = this.state.collectedLore.length;
+    const totalLore = Object.keys(LORE_FRAGMENTS).length;
+    const journalCount = this.state.journalEntries.length;
+
+    appendMessage(`—— 📜 文献/记录 ——`, 'system');
+    appendMessage(`文献碎片：${loreCount}/${totalLore} | 旧日志：${journalCount}`, 'system');
+
+    // Show discovered weaknesses
+    if (this.state.discoveredWeaknesses.length > 0) {
+      appendMessage('', 'divider');
+      appendMessage('已发现的弱点：', 'system');
+      for (const wid of this.state.discoveredWeaknesses) {
+        const w = BOSS_WEAKNESSES[wid];
+        if (w) appendMessage(`  ⚠️ ${w.name} — ${w.effectType === 'item' ? `使用${ITEMS[w.effectValue]?.name ?? w.effectValue}` : `使用技能${SKILLS[w.effectValue]?.name ?? w.effectValue}`} 伤害x${w.damageMultiplier}`, 'loot');
+      }
+    }
+
+    appendMessage('', 'divider');
+
+    const actions: ActionButton[] = [];
+
+    // View lore fragments
+    if (loreCount > 0) {
+      actions.push({
+        text: `📖 查看文献碎片 (${loreCount})`,
+        callback: () => {
+          clearMessages();
+          appendMessage('—— 📖 文献碎片 ——', 'system');
+          for (const loreId of this.state.collectedLore) {
+            const lore = LORE_FRAGMENTS[loreId];
+            if (lore) {
+              appendMessage(`【${lore.title}】(${lore.category})`, 'event');
+              appendMessage(lore.content, 'narrator');
+              appendMessage('', 'divider');
+            }
+          }
+          setActions([{ text: '🔙 返回', callback: () => this.showLiteratureMenu() }]);
+        },
+      });
+    }
+
+    // View old journals
+    if (journalCount > 0) {
+      actions.push({
+        text: `📜 旧日志 (${journalCount})`,
+        callback: () => this.showJournal(),
+      });
+    }
+
+    // Attempt puzzles
+    const availablePuzzles = Object.values(PUZZLES).filter(
+      p => !this.state.solvedPuzzles.includes(p.id)
+    );
+    if (availablePuzzles.length > 0) {
+      actions.push({
+        text: `🧩 谜题 (${availablePuzzles.length}个可尝试)`,
+        callback: () => this.showPuzzleMenu(),
+      });
+    }
+
+    actions.push({ text: '🔙 返回', callback: () => { clearMessages(); this.showBaseActions(); } });
+    setActions(actions);
+  }
+
+  private showPuzzleMenu() {
+    clearMessages();
+    appendMessage('—— 🧩 谜题 ——', 'system');
+    appendMessage('使用收集到的文献碎片来解开谜题。', 'narrator');
+    appendMessage('', 'divider');
+
+    const actions: ActionButton[] = [];
+
+    for (const puzzle of Object.values(PUZZLES)) {
+      if (this.state.solvedPuzzles.includes(puzzle.id)) continue;
+
+      const hasAllLore = puzzle.requiredLoreIds.every(
+        id => this.state.collectedLore.includes(id)
+      );
+      const missingCount = puzzle.requiredLoreIds.filter(
+        id => !this.state.collectedLore.includes(id)
+      ).length;
+
+      if (hasAllLore) {
+        actions.push({
+          text: `🧩 ${puzzle.name} ✓可解`,
+          primary: true,
+          callback: () => this.solvePuzzle(puzzle.id),
+        });
+      } else {
+        actions.push({
+          text: `🧩 ${puzzle.name} (缺${missingCount}条线索)`,
+          disabled: true,
+          callback: () => {},
+        });
+      }
+    }
+
+    actions.push({ text: '🔙 返回', callback: () => this.showLiteratureMenu() });
+    setActions(actions);
+  }
+
+  private solvePuzzle(puzzleId: string) {
+    const puzzle = PUZZLES[puzzleId];
+    if (!puzzle) return;
+
+    clearMessages();
+    appendMessage(`—— 🧩 ${puzzle.name} ——`, 'system');
+    appendMessage(puzzle.desc, 'narrator');
+    appendMessage('', 'divider');
+    appendMessage('你将收集到的线索拼凑在一起……', 'narrator');
+    appendMessage('', 'divider');
+    appendMessage(`🎉 谜题解开了！`, 'loot');
+
+    this.state.solvedPuzzles.push(puzzleId);
+
+    // Apply rewards
+    const r = puzzle.rewards;
+    if (r.gold) {
+      this.state.gold += r.gold;
+      appendMessage(`💰 +${r.gold} 金币`, 'loot');
+    }
+    if (r.exp) {
+      this.state.party[0].exp += r.exp;
+      appendMessage(`📊 +${r.exp} 经验值`, 'loot');
+      this.checkJobLevelUp();
+    }
+    if (r.items) {
+      for (const item of r.items) {
+        if (addItem(this.state, item.id, item.count)) {
+          appendMessage(`🎁 获得【${ITEMS[item.id]?.name ?? item.id}】x${item.count}`, 'loot');
+        }
+      }
+    }
+    if (r.unlockNodes) {
+      for (const nid of r.unlockNodes) {
+        if (!this.state.unlockedNodeIds.includes(nid)) {
+          this.state.unlockedNodeIds.push(nid);
+          const node = WORLD_NODES[nid];
+          appendMessage(`🗺️ 新地点解锁：${node?.icon ?? ''} ${node?.name ?? nid}`, 'event');
+        }
+      }
+    }
+    if (r.revealWeakness) {
+      if (!this.state.discoveredWeaknesses.includes(r.revealWeakness)) {
+        this.state.discoveredWeaknesses.push(r.revealWeakness);
+        const w = BOSS_WEAKNESSES[r.revealWeakness];
+        if (w) {
+          appendMessage(`⚠️ 发现了弱点：${w.name}！`, 'event');
+        }
+      }
+    }
+
+    updateStatusBar(this.state);
+    saveState(this.state);
+
+    setActions([{ text: '🔙 返回', callback: () => this.showLiteratureMenu() }]);
+  }
+
+  // === Karma Status ===
+
+  private showKarmaStatus() {
+    clearMessages();
+    const k = this.state.karma;
+    const tier = k >= 50 ? '圣者' : k >= 20 ? '善人' : k > -20 ? '中立' : k > -50 ? '恶人' : '堕落者';
+    appendMessage(`—— ⚖️ 因果系统 ——`, 'system');
+    appendMessage(`当前因果值: ${k} (${tier})`, 'narrator');
+    appendMessage('', 'divider');
+
+    if (k >= 50) {
+      appendMessage('你的善行已被世人铭记。有些人愿意主动帮助你。', 'event');
+    } else if (k >= 20) {
+      appendMessage('你是个好人，废土中的人们信任你。', 'event');
+    } else if (k > -20) {
+      appendMessage('你既不善也不恶，只是一个努力活下去的人。', 'event');
+    } else if (k > -50) {
+      appendMessage('你的所作所为让人畏惧。有些人会拒绝与你合作。', 'event');
+    } else {
+      appendMessage('黑暗笼罩着你。你的名字成了恐惧的代名词。', 'event');
+    }
+
+    appendMessage('', 'divider');
+    appendMessage('因果影响:', 'system');
+    appendMessage('· 因果值影响NPC态度和部分事件选项', 'narrator');
+    appendMessage('· 极端因果值可解锁特殊节点和结局', 'narrator');
+    appendMessage('· 部分同伴只会加入善良/邪恶的队伍', 'narrator');
+
+    if (this.state.karmaHistory.length > 0) {
+      appendMessage('', 'divider');
+      appendMessage('最近因果记录:', 'system');
+      const recent = this.state.karmaHistory.slice(-5);
+      for (const entry of recent) {
+        const sign = entry.karmaChange > 0 ? '+' : '';
+        appendMessage(`  第${entry.day}天: ${sign}${entry.karmaChange}`, entry.karmaChange > 0 ? 'loot' : 'combat');
+      }
+    }
+
     setActions([{ text: '🔙 返回', callback: () => { clearMessages(); this.showBaseActions(); } }]);
   }
 
@@ -698,6 +976,153 @@ export class Game {
     }
 
     setActions([{ text: '🔙 返回', callback: () => { clearMessages(); this.showBaseActions(); } }]);
+  }
+
+  // ==================== JOB SYSTEM ====================
+
+  private showJobMenu(selectedJobId?: string) {
+    clearMessages();
+    const p = this.state.party[0];
+    const currentJob = JOBS[p.currentJobId];
+    const jobLv = p.jobLevels[p.currentJobId] ?? 1;
+
+    appendMessage(`—— 🎭 职业系统 ——`, 'system');
+    appendMessage(`当前职业：${currentJob?.icon ?? '?'} ${currentJob?.name ?? p.currentJobId} Lv.${jobLv}`, 'narrator');
+    appendMessage(`SP: ${p.sp} | 技能点: ${this.state.skillPoints}`, 'system');
+
+    // Show current job skills
+    if (currentJob) {
+      const unlocked = currentJob.skillUnlocks.filter(u => jobLv >= u.jobLevel);
+      const locked = currentJob.skillUnlocks.filter(u => jobLv < u.jobLevel);
+      if (unlocked.length > 0) {
+        appendMessage('已解锁技能：', 'system');
+        for (const u of unlocked) {
+          const s = SKILLS[u.skillId];
+          if (s) appendMessage(`  ${s.icon} ${s.name} — ${s.desc}`, 'narrator');
+        }
+      }
+      if (locked.length > 0) {
+        appendMessage('未解锁：', 'system');
+        for (const u of locked) {
+          const s = SKILLS[u.skillId];
+          if (s) appendMessage(`  Lv.${u.jobLevel} → ${s.icon} ${s.name}`, 'system');
+        }
+      }
+    }
+
+    // Selected job detail
+    if (selectedJobId && selectedJobId !== p.currentJobId) {
+      const job = JOBS[selectedJobId];
+      if (job) {
+        appendMessage('', 'divider');
+        appendMessage(`${job.icon} ${job.name}`, 'event');
+        appendMessage(job.desc, 'narrator');
+        appendMessage(`转职消耗：${job.spCost} SP`, 'system');
+        appendMessage(`成长：HP+${job.growth.hp} MP+${job.growth.mp} ATK+${job.growth.attack} DEF+${job.growth.defense} SPD+${job.growth.speed}`, 'system');
+
+        // Check prerequisites
+        const prereqMet = job.prerequisiteJobs.every(
+          req => (p.jobLevels[req.jobId] ?? 0) >= req.level
+        );
+        const prereqStr = job.prerequisiteJobs.map(
+          req => `${JOBS[req.jobId]?.name ?? req.jobId} Lv.${req.level}`
+        ).join(', ');
+        if (job.prerequisiteJobs.length > 0) {
+          appendMessage(`前置条件：${prereqStr} ${prereqMet ? '✓' : '✗'}`, prereqMet ? 'loot' : 'combat');
+        }
+
+        const canChange = prereqMet && p.sp >= job.spCost;
+        setActions([
+          {
+            text: canChange ? `🎭 转职为${job.name} (-${job.spCost}SP)` : `🎭 无法转职`,
+            primary: canChange,
+            disabled: !canChange,
+            callback: () => {
+              p.sp -= job.spCost;
+              p.currentJobId = job.id;
+              if (!p.jobLevels[job.id]) p.jobLevels[job.id] = 1;
+              // Unlock job level 1 skills
+              for (const u of job.skillUnlocks) {
+                if ((p.jobLevels[job.id] ?? 1) >= u.jobLevel && !this.state.skills.includes(u.skillId)) {
+                  this.state.skills.push(u.skillId);
+                  const s = SKILLS[u.skillId];
+                  appendMessage(`⚡ 学会了：${s?.icon ?? ''} ${s?.name ?? u.skillId}！`, 'loot');
+                }
+              }
+              saveState(this.state);
+              clearMessages();
+              appendMessage(`🎭 转职成功！现在是 ${job.icon} ${job.name}！`, 'loot');
+              this.showJobMenu();
+            },
+          },
+          { text: '🔙 返回', callback: () => this.showJobMenu() },
+        ]);
+        return;
+      }
+    }
+
+    // Job list
+    appendMessage('', 'divider');
+    appendMessage('可选职业：', 'system');
+
+    const actions: ActionButton[] = [];
+    for (const jobId of Object.keys(JOBS)) {
+      const job = JOBS[jobId];
+      const isCurrentJob = jobId === p.currentJobId;
+      const lvl = p.jobLevels[jobId] ?? 0;
+      const prereqMet = job.prerequisiteJobs.every(
+        req => (p.jobLevels[req.jobId] ?? 0) >= req.level
+      );
+
+      if (isCurrentJob) {
+        actions.push({ text: `${job.icon} ${job.name} Lv.${lvl} [当前]`, disabled: true, callback: () => {} });
+      } else if (!prereqMet) {
+        const prereqs = job.prerequisiteJobs.map(r => `${JOBS[r.jobId]?.name ?? r.jobId} Lv.${r.level}`).join(', ');
+        actions.push({ text: `${job.icon} ${job.name} 🔒(需${prereqs})`, disabled: true, callback: () => {} });
+      } else {
+        actions.push({
+          text: `${job.icon} ${job.name}${lvl > 0 ? ` Lv.${lvl}` : ''} (${job.spCost}SP)`,
+          callback: () => this.showJobMenu(jobId),
+        });
+      }
+    }
+
+    actions.push({ text: '🔙 返回', callback: () => { clearMessages(); this.showBaseActions(); } });
+    setActions(actions);
+  }
+
+  /** Level up the current job when gaining exp — call after combat victory */
+  private checkJobLevelUp() {
+    const p = this.state.party[0];
+    const job = JOBS[p.currentJobId];
+    if (!job) return;
+    const currentLv = p.jobLevels[p.currentJobId] ?? 1;
+    // Simple exp threshold: level * 20
+    const expNeeded = currentLv * 20;
+    if (p.exp >= expNeeded && currentLv < 10) {
+      p.exp -= expNeeded;
+      p.jobLevels[p.currentJobId] = currentLv + 1;
+      const newLv = currentLv + 1;
+      // Apply growth
+      p.maxHp += job.growth.hp;
+      p.hp += job.growth.hp;
+      p.maxMp += job.growth.mp;
+      p.mp += job.growth.mp;
+      p.baseAttack += job.growth.attack;
+      p.baseDefense += job.growth.defense;
+      p.speed += job.growth.speed;
+      this.state.maxHpBase += job.growth.hp;
+      appendMessage(`🎉 ${job.icon} ${job.name} 升级到 Lv.${newLv}！`, 'loot');
+      appendMessage(`  HP+${job.growth.hp} MP+${job.growth.mp} ATK+${job.growth.attack} DEF+${job.growth.defense} SPD+${job.growth.speed}`, 'system');
+      // Unlock new skills at this level
+      for (const u of job.skillUnlocks) {
+        if (newLv >= u.jobLevel && !this.state.skills.includes(u.skillId)) {
+          this.state.skills.push(u.skillId);
+          const s = SKILLS[u.skillId];
+          appendMessage(`⚡ 学会了新技能：${s?.icon ?? ''} ${s?.name ?? u.skillId}！`, 'loot');
+        }
+      }
+    }
   }
 
   private showSkillsPage(selectedId?: string) {
@@ -973,6 +1398,436 @@ export class Game {
     return { added: addItem(this.state, itemId), name: def.name };
   }
 
+  // ==================== WORLD MAP ====================
+
+  /** Check if a node should be unlocked based on its conditions */
+  private isNodeUnlocked(node: WorldNode): boolean {
+    if (this.state.unlockedNodeIds.includes(node.id)) return true;
+    const cond = node.unlockCondition;
+    switch (cond.type) {
+      case 'none': return true;
+      case 'clear_node': return this.state.clearedNodeIds.includes(cond.value as string);
+      case 'day': return this.state.day >= (cond.value as number);
+      case 'quest': return this.state.completedQuests.includes(cond.value as string);
+      case 'karma': return Math.abs(this.state.karma) >= (cond.value as number);
+      case 'lore_count': return this.state.collectedLore.length >= (cond.value as number);
+      default: return false;
+    }
+  }
+
+  /** Refresh which nodes are unlocked */
+  private refreshNodeUnlocks() {
+    for (const nodeId of Object.keys(WORLD_NODES)) {
+      if (!this.state.unlockedNodeIds.includes(nodeId) && this.isNodeUnlocked(WORLD_NODES[nodeId])) {
+        this.state.unlockedNodeIds.push(nodeId);
+      }
+    }
+  }
+
+  private showWorldMap() {
+    this.refreshNodeUnlocks();
+    clearMessages();
+    appendMessage('—— 🗺️ 世界地图 ——', 'system');
+    appendMessage(`当前位置：${WORLD_NODES[this.state.currentNodeId ?? 'camp']?.name ?? '营地'} | 体力：${this.state.stamina}/${this.state.maxStamina} | 第${this.state.day}天`, 'system');
+    appendMessage('', 'divider');
+
+    const currentNodeId = this.state.currentNodeId ?? 'camp';
+    const currentNode = WORLD_NODES[currentNodeId];
+    if (!currentNode) {
+      this.showBaseActions();
+      return;
+    }
+
+    // Show available destinations
+    const destinations = currentNode.connections
+      .filter(id => this.state.unlockedNodeIds.includes(id))
+      .map(id => WORLD_NODES[id])
+      .filter(Boolean);
+
+    // Show locked connections as hints
+    const lockedConns = currentNode.connections
+      .filter(id => !this.state.unlockedNodeIds.includes(id))
+      .map(id => WORLD_NODES[id])
+      .filter(Boolean);
+
+    if (destinations.length > 0) {
+      appendMessage('可前往的地点：', 'system');
+    }
+
+    const actions: ActionButton[] = [];
+
+    for (const dest of destinations) {
+      const isCleared = this.state.clearedNodeIds.includes(dest.id);
+      const costMultiplier = getHungerMultiplier(this.state);
+      const staCost = dest.staminaCost * costMultiplier;
+      const canTravel = this.state.stamina >= staCost;
+      const clearedTag = isCleared ? ' ✓' : '';
+      const bossTag = dest.bossId && !isCleared ? ' ⚠️BOSS' : '';
+
+      actions.push({
+        text: `${dest.icon} ${dest.name} (${staCost}体力)${clearedTag}${bossTag}`,
+        primary: !isCleared && canTravel,
+        disabled: !canTravel,
+        callback: () => this.travelToNode(dest.id),
+      });
+    }
+
+    for (const locked of lockedConns) {
+      const cond = locked.unlockCondition;
+      let hint = '???';
+      if (cond.type === 'clear_node') hint = `通关${WORLD_NODES[cond.value as string]?.name ?? '?'}`;
+      else if (cond.type === 'day') hint = `第${cond.value}天`;
+      else if (cond.type === 'quest') hint = '完成特定任务';
+      actions.push({
+        text: `🔒 ${locked.icon} ${locked.name} (${hint})`,
+        disabled: true,
+        callback: () => {},
+      });
+    }
+
+    // If at camp, show return button; otherwise show camp return
+    if (currentNodeId === 'camp') {
+      actions.push({ text: '🔙 返回营地', callback: () => { clearMessages(); this.showBaseActions(); } });
+    } else {
+      const campNode = WORLD_NODES['camp'];
+      const campCost = (campNode?.staminaCost ?? 0) * getHungerMultiplier(this.state);
+      actions.push({
+        text: `🏕️ 返回营地 (${campCost}体力)`,
+        primary: false,
+        callback: () => {
+          this.state.currentNodeId = 'camp';
+          clearMessages();
+          appendMessage('你返回了营地。', 'narrator');
+          this.showBaseActions();
+        },
+      });
+    }
+
+    setActions(actions);
+  }
+
+  private travelToNode(nodeId: string) {
+    const node = WORLD_NODES[nodeId];
+    if (!node) return;
+
+    // Deduct stamina
+    const cost = node.staminaCost * getHungerMultiplier(this.state);
+    this.state.stamina -= cost;
+    this.state.currentNodeId = nodeId;
+
+    if (this.state.stamina <= 0) {
+      this.state.stamina = 0;
+      this.state.party[0].hp -= 2;
+      appendMessage('⚠️ 你精疲力竭…… (HP -2)', 'combat');
+      if (this.state.party[0].hp <= 0) {
+        this.onDeath();
+        return;
+      }
+    }
+
+    clearMessages();
+    appendMessage(`你前往了 ${node.icon} ${node.name}……`, 'narrator');
+    appendMessage(node.desc, 'narrator');
+
+    updateStatusBar(this.state);
+    saveState(this.state);
+
+    switch (node.type) {
+      case 'camp':
+        this.showBaseActions();
+        break;
+      case 'dungeon':
+      case 'boss_lair':
+        // Set floor to node's level range and enter dungeon
+        this.state.floor = node.levelRange[0];
+        this.enterDungeon();
+        break;
+      case 'field':
+        this.handleFieldNode(node);
+        break;
+      case 'outpost':
+        this.handleOutpostNode(node);
+        break;
+      case 'ruin':
+        this.handleFieldNode(node);
+        break;
+      default:
+        this.handleFieldNode(node);
+        break;
+    }
+  }
+
+  /** Handle a field/ruin node — single encounter based on node encounters list */
+  private handleFieldNode(node: WorldNode) {
+    showHomeButton(() => {
+      this.state.currentNodeId = 'camp';
+      this.returnToBase();
+    });
+
+    if (node.encounters.length === 0) {
+      appendMessage('这里似乎没什么特别的。', 'narrator');
+      if (!this.state.clearedNodeIds.includes(node.id)) {
+        this.state.clearedNodeIds.push(node.id);
+      }
+      this.refreshNodeUnlocks();
+      setActions([{
+        text: '🗺️ 继续探索',
+        primary: true,
+        callback: () => this.showWorldMap(),
+      }]);
+      return;
+    }
+
+    // Pick a random encounter based on weights
+    const totalWeight = node.encounters.reduce((sum, e) => sum + (e.weight ?? 1), 0);
+    let roll = Math.random() * totalWeight;
+    let encounter = node.encounters[0];
+    for (const enc of node.encounters) {
+      roll -= enc.weight ?? 1;
+      if (roll <= 0) { encounter = enc; break; }
+    }
+
+    // Handle one-time encounters
+    const ns = this.state.nodeState[node.id] ?? { exploredRooms: [], internalMap: null, visitCounts: {}, bossDefeated: false };
+    if (encounter.oneTime && ns.visitCounts[encounter.id]) {
+      // Already done, pick another or show empty
+      appendMessage('这里你已经探索过了，没有新发现。', 'narrator');
+      setActions([{
+        text: '🗺️ 返回地图',
+        primary: true,
+        callback: () => this.showWorldMap(),
+      }]);
+      return;
+    }
+    ns.visitCounts[encounter.id] = (ns.visitCounts[encounter.id] ?? 0) + 1;
+    this.state.nodeState[node.id] = ns;
+
+    // FIX C6: limit gambler encounters to 3 per node visit
+    if (encounter.type === 'event' && encounter.id.includes('gambl')) {
+      const count = ns.visitCounts[encounter.id] ?? 0;
+      if (count > 3) {
+        appendMessage('赌徒已经离开了。', 'narrator');
+        setActions([{
+          text: '🗺️ 返回地图',
+          primary: true,
+          callback: () => this.showWorldMap(),
+        }]);
+        return;
+      }
+    }
+
+    switch (encounter.type) {
+      case 'combat': {
+        const enemyData = ENEMIES[encounter.id];
+        if (enemyData) {
+          this.startCombat(enemyData, enemyData.hp, -1, (escaped) => {
+            if (!escaped && !this.state.clearedNodeIds.includes(node.id)) {
+              // Mark node as cleared after defeating combat
+              if (!node.bossId) this.state.clearedNodeIds.push(node.id);
+            }
+            this.refreshNodeUnlocks();
+            setActions([{
+              text: '🗺️ 返回地图',
+              primary: true,
+              callback: () => this.showWorldMap(),
+            }]);
+          });
+        } else {
+          appendMessage(`遇到了未知敌人...`, 'narrator');
+          setActions([{ text: '🗺️ 返回地图', primary: true, callback: () => this.showWorldMap() }]);
+        }
+        break;
+      }
+      case 'lore': {
+        // Collect lore fragment
+        const lore = LORE_FRAGMENTS[encounter.id];
+        if (!this.state.collectedLore.includes(encounter.id)) {
+          this.state.collectedLore.push(encounter.id);
+          if (lore) {
+            appendMessage(`📜 发现文献：【${lore.title}】`, 'loot');
+            appendMessage(lore.content, 'narrator');
+          } else {
+            appendMessage(`📜 发现了文献碎片：【${encounter.id}】`, 'loot');
+          }
+        } else {
+          appendMessage('这里的记录你已经看过了。', 'narrator');
+        }
+        setActions([{ text: '🗺️ 返回地图', primary: true, callback: () => this.showWorldMap() }]);
+        break;
+      }
+      case 'recruit': {
+        const comp = COMPANIONS[encounter.id];
+        if (!comp) {
+          appendMessage('这里似乎曾有人驻足……但已经离开了。', 'narrator');
+          setActions([{ text: '🗺️ 返回地图', primary: true, callback: () => this.showWorldMap() }]);
+          break;
+        }
+        // Already recruited?
+        const alreadyHave = this.state.party.some(m => m.id === comp.id) || this.state.companions.some(m => m.id === comp.id);
+        if (alreadyHave) {
+          appendMessage('这里你已经探索过了。', 'narrator');
+          setActions([{ text: '🗺️ 返回地图', primary: true, callback: () => this.showWorldMap() }]);
+          break;
+        }
+        // Karma check for wolf companion
+        if (comp.recruitCondition.type === 'karma_threshold') {
+          const threshold = comp.recruitCondition.value as number;
+          if (threshold < 0 && this.state.karma > threshold) {
+            appendMessage(`远处传来低沉的咆哮声，但那个身影似乎不信任你……`, 'narrator');
+            setActions([{ text: '🗺️ 返回地图', primary: true, callback: () => this.showWorldMap() }]);
+            break;
+          }
+        }
+        appendMessage(`${comp.icon} 你遇到了 ${comp.name}`, 'event');
+        appendMessage(comp.desc, 'narrator');
+        appendMessage(`性格: ${comp.personality} | 职业: ${JOBS[comp.defaultJobId]?.name ?? comp.defaultJobId}`, 'system');
+        appendMessage(`HP:${comp.baseStats.hp} ATK:${comp.baseStats.attack} DEF:${comp.baseStats.defense} SPD:${comp.baseStats.speed}`, 'system');
+
+        setActions([
+          {
+            text: `🤝 邀请${comp.name}加入`,
+            primary: true,
+            callback: () => {
+              const member: PartyMember = {
+                id: comp.id,
+                companionId: comp.id,
+                name: comp.name,
+                level: 1,
+                exp: 0,
+                hp: comp.baseStats.hp,
+                maxHp: comp.baseStats.hp,
+                mp: comp.baseStats.mp,
+                maxMp: comp.baseStats.mp,
+                baseAttack: comp.baseStats.attack,
+                baseDefense: comp.baseStats.defense,
+                speed: comp.baseStats.speed,
+                currentJobId: comp.defaultJobId,
+                jobLevels: { [comp.defaultJobId]: 1 },
+                sp: 0,
+                equipment: { weapon: null, armor: null, accessory: null },
+                learnedSkills: [],
+                equippedSkills: [],
+                statusEffects: [],
+                isAlive: true,
+              };
+              // Add to party if < 4, otherwise to reserves
+              if (this.state.party.length < 4) {
+                this.state.party.push(member);
+                appendMessage(`${comp.icon} ${comp.name}加入了队伍！`, 'loot');
+              } else {
+                this.state.companions.push(member);
+                appendMessage(`${comp.icon} ${comp.name}加入了后备队伍（营地可管理）`, 'loot');
+              }
+              this.state.karma += 3;
+              updateStatusBar(this.state);
+              setActions([{ text: '🗺️ 返回地图', primary: true, callback: () => this.showWorldMap() }]);
+            },
+          },
+          {
+            text: '🚶 继续赶路',
+            callback: () => {
+              appendMessage(`${comp.name}目送你离开，也许你们还会再见。`, 'narrator');
+              setActions([{ text: '🗺️ 返回地图', primary: true, callback: () => this.showWorldMap() }]);
+            },
+          },
+        ]);
+        break;
+      }
+      case 'rest': {
+        const heal = Math.ceil(this.state.party[0].maxHp * 0.3);
+        this.state.party[0].hp = Math.min(this.state.party[0].maxHp, this.state.party[0].hp + heal);
+        appendMessage(`你找到了一个安全的角落休息。❤️ +${heal}`, 'loot');
+        updateStatusBar(this.state);
+        setActions([{ text: '🗺️ 返回地图', primary: true, callback: () => this.showWorldMap() }]);
+        break;
+      }
+      case 'puzzle': {
+        // Find puzzles associated with this node
+        const nodePuzzles = Object.values(PUZZLES).filter(p => p.nodeId === node.id && !this.state.solvedPuzzles.includes(p.id));
+        if (nodePuzzles.length > 0) {
+          const puzzle = nodePuzzles[0];
+          appendMessage(`📜 你发现了一个谜题：${puzzle.name}`, 'event');
+          appendMessage(puzzle.desc, 'narrator');
+          // Check if player has required lore
+          const hasAllLore = puzzle.requiredLoreIds.every(id => this.state.collectedLore.includes(id));
+          if (hasAllLore) {
+            setActions([
+              { text: '🧩 尝试解答', primary: true, callback: () => this.solvePuzzle(puzzle.id) },
+              { text: '🗺️ 返回地图', callback: () => this.showWorldMap() },
+            ]);
+          } else {
+            appendMessage(`你缺少关键的文献线索……还需要收集更多资料。`, 'system');
+            setActions([{ text: '🗺️ 返回地图', primary: true, callback: () => this.showWorldMap() }]);
+          }
+        } else {
+          appendMessage('这里的谜题你已经全部解开了。', 'narrator');
+          setActions([{ text: '🗺️ 返回地图', primary: true, callback: () => this.showWorldMap() }]);
+        }
+        break;
+      }
+      default: {
+        // Event or trader — use existing event system
+        appendMessage('你发现了一些有趣的东西。', 'narrator');
+        // Give a small reward
+        const g = rand(5, 15);
+        this.state.gold += g;
+        appendMessage(`💰 +${g} 金币`, 'loot');
+        setActions([{ text: '🗺️ 返回地图', primary: true, callback: () => this.showWorldMap() }]);
+        break;
+      }
+    }
+  }
+
+  /** Handle outpost node — safe area with trading */
+  private handleOutpostNode(node: WorldNode) {
+    showHomeButton(() => {
+      this.state.currentNodeId = 'camp';
+      this.returnToBase();
+    });
+
+    appendMessage(`${node.icon} ${node.name}`, 'event');
+    appendMessage(node.desc, 'narrator');
+    appendMessage('', 'divider');
+
+    const actions: ActionButton[] = [];
+
+    // Rest option
+    actions.push({
+      text: '😴 休息',
+      disabled: this.state.party[0].hp >= this.state.party[0].maxHp,
+      callback: () => {
+        const heal = Math.ceil(this.state.party[0].maxHp * 0.5);
+        this.state.party[0].hp = Math.min(this.state.party[0].maxHp, this.state.party[0].hp + heal);
+        this.state.stamina = Math.min(this.state.maxStamina, this.state.stamina + 30);
+        appendMessage(`休息了一会儿。❤️ +${heal}，体力 +30`, 'loot');
+        updateStatusBar(this.state);
+        this.handleOutpostNode(node);
+      },
+    });
+
+    // Look around for encounters
+    actions.push({
+      text: '🔍 四处看看',
+      callback: () => {
+        clearMessages();
+        this.handleFieldNode(node);
+      },
+    });
+
+    // Mark as visited
+    if (!this.state.clearedNodeIds.includes(node.id)) {
+      this.state.clearedNodeIds.push(node.id);
+      this.refreshNodeUnlocks();
+    }
+
+    actions.push({
+      text: '🗺️ 返回地图',
+      callback: () => { clearMessages(); this.showWorldMap(); },
+    });
+
+    setActions(actions);
+  }
+
   // ==================== DUNGEON / MAP ====================
 
   private enterEndless() {
@@ -1063,25 +1918,25 @@ export class Game {
     // Consume resources (hunger multiplier from bloodlust)
     this.state.turns++;
     const hungerCost = 3 * getHungerMultiplier(this.state);
-    this.state.hunger -= hungerCost;
-    if (this.state.hunger <= 0) {
-      this.state.hunger = 0;
-      this.state.hp -= 2;
-      appendMessage('⚠️ 你饿得头晕眼花…… (HP -2)', 'combat');
-    } else if (this.state.hunger <= Math.floor(this.state.maxHunger * 0.3) && this.state.hunger > 0) {
-      appendMessage('⚠️ 你感到饥肠辘辘，快吃点东西吧！（打开背包使用食物）', 'system');
+    this.state.stamina -= hungerCost;
+    if (this.state.stamina <= 0) {
+      this.state.stamina = 0;
+      this.state.party[0].hp -= 2;
+      appendMessage('⚠️ 你精疲力竭…… (HP -2)', 'combat');
+    } else if (this.state.stamina <= Math.floor(this.state.maxStamina * 0.3) && this.state.stamina > 0) {
+      appendMessage('⚠️ 你感到体力不支，快补充点能量吧！（打开背包使用食物）', 'system');
     }
 
-    if (this.state.hp <= 0) {
+    if (this.state.party[0].hp <= 0) {
       this.onDeath();
       return;
     }
 
     // Regen mutation: +3 HP on entering new room
     if (this.state.activeMutation === 'regen') {
-      const heal = Math.min(3, this.state.maxHp - this.state.hp);
+      const heal = Math.min(3, this.state.party[0].maxHp - this.state.party[0].hp);
       if (heal > 0) {
-        this.state.hp += heal;
+        this.state.party[0].hp += heal;
         appendMessage(`🧬 再生体：❤️ +${heal}`, 'loot');
       }
     }
@@ -1374,8 +2229,8 @@ export class Game {
         text: '😴 休息 (❤️ +10, 🍖 -10)',
         primary: true,
         callback: () => {
-          this.state.hp = Math.min(this.state.maxHp, this.state.hp + 10);
-          this.state.hunger = Math.max(0, this.state.hunger - 10);
+          this.state.party[0].hp = Math.min(this.state.party[0].maxHp, this.state.party[0].hp + 10);
+          this.state.stamina = Math.max(0, this.state.stamina - 10);
           appendMessage('你小睡了一会儿，感觉好多了。', 'narrator');
           appendMessage('❤️ +10 HP', 'loot');
           room.cleared = true;
@@ -1448,9 +2303,9 @@ export class Game {
     actions.push({
       text: '💪 暴力破门 (HP -5)',
       callback: () => {
-        this.state.hp -= 5;
+        this.state.party[0].hp -= 5;
         appendMessage('你用力撞开了门，肩膀疼得厉害。(HP -5)', 'combat');
-        if (this.state.hp <= 0) { this.onDeath(); return; }
+        if (this.state.party[0].hp <= 0) { this.onDeath(); return; }
         const id = rollLoot(this.state.floor);
         if (addItem(this.state, id)) {
           appendMessage(`🎁 获得【${ITEMS[id].name}】`, 'loot');
@@ -1510,7 +2365,7 @@ export class Game {
             }
           }
           if (result.hp) {
-            this.state.hp = Math.max(0, Math.min(this.state.maxHp, this.state.hp + result.hp));
+            this.state.party[0].hp = Math.max(0, Math.min(this.state.party[0].maxHp, this.state.party[0].hp + result.hp));
           }
 
           updateStatusBar(this.state);
@@ -1547,7 +2402,7 @@ export class Game {
             appendMessage(`💰 +${outcome.gold}`, 'loot');
           }
           if (outcome.hp) {
-            this.state.hp = Math.max(0, Math.min(this.state.maxHp, this.state.hp + outcome.hp));
+            this.state.party[0].hp = Math.max(0, Math.min(this.state.party[0].maxHp, this.state.party[0].hp + outcome.hp));
             appendMessage(`💔 HP ${outcome.hp}`, 'combat');
           }
           if (outcome.item) {
@@ -1580,7 +2435,7 @@ export class Game {
             appendMessage(`  效果：${m.benefit} | 代价：${m.cost}`, 'system');
           }
 
-          if (this.state.hp <= 0) { this.onDeath(); return; }
+          if (this.state.party[0].hp <= 0) { this.onDeath(); return; }
           room.cleared = true;
           updateStatusBar(this.state);
           this.showMapView();
@@ -1610,48 +2465,63 @@ export class Game {
       actions.push({
         text: `${deal.offer} — ${deal.costDesc}`,
         callback: () => {
-          appendMessage(`你接受了交易。`, 'narrator');
-          appendMessage(`${deal.offerDesc}`, 'event');
+          // FIX M2: Confirmation dialog for permanent-cost deals
+          showConfirm(`确定要交易吗？\n获得: ${deal.offerDesc}\n代价: ${deal.costDesc}\n\n⚠️ 此操作不可撤销！`, () => {
+            appendMessage(`你接受了交易。`, 'narrator');
+            appendMessage(`${deal.offerDesc}`, 'event');
 
-          // Apply cost
-          if (deal.costType === 'maxHp') {
-            this.state.maxHpBase -= deal.costAmount;
-            this.state.maxHp = this.state.maxHpBase + this.state.baseLevel.shelter * 5;
-            if (this.state.activeMutation === 'flesh') {
-              this.state.maxHp = Math.floor(this.state.maxHpBase * 0.75);
-            }
-            this.state.hp = Math.min(this.state.hp, this.state.maxHp);
-            appendMessage(`💔 最大HP永久 -${deal.costAmount}`, 'combat');
-          } else {
-            this.state.maxHunger -= deal.costAmount;
-            this.state.hunger = Math.min(this.state.hunger, this.state.maxHunger);
-            appendMessage(`😫 最大饱食永久 -${deal.costAmount}`, 'combat');
-          }
-
-          // Apply reward
-          if (deal.item) {
-            if (addItem(this.state, deal.item)) {
-              const def = ITEMS[deal.item];
-              appendMessage(`🎁 获得【${def.name}】`, 'loot');
-            } else {
-              appendMessage('背包已满，物品丢失了……', 'combat');
-            }
-          }
-
-          // Special: reveal map
-          if (deal.offer === '全图透视') {
-            const map = this.state.map;
-            if (map) {
-              for (const r of map.rooms) {
-                r.explored = true;
+            // Apply cost
+            if (deal.costType === 'maxHp') {
+              this.state.maxHpBase -= deal.costAmount;
+              const cleanMaxHp = this.state.maxHpBase + this.state.baseLevel.shelter * 5;
+              if (this.state.activeMutation === 'flesh') {
+                this.state.party[0].maxHp = Math.floor(cleanMaxHp * 0.75);
+              } else {
+                this.state.party[0].maxHp = cleanMaxHp;
               }
-              appendMessage('👁️ 整层地图已显现。', 'loot');
+              this.state.party[0].hp = Math.min(this.state.party[0].hp, this.state.party[0].maxHp);
+              appendMessage(`💔 最大HP永久 -${deal.costAmount}`, 'combat');
+            } else {
+              this.state.maxStamina -= deal.costAmount;
+              this.state.stamina = Math.min(this.state.stamina, this.state.maxStamina);
+              appendMessage(`😫 最大体力永久 -${deal.costAmount}`, 'combat');
             }
-          }
 
-          room.cleared = true;
-          updateStatusBar(this.state);
-          this.showMapView();
+            // Apply reward
+            if (deal.item) {
+              if (addItem(this.state, deal.item)) {
+                const def = ITEMS[deal.item];
+                appendMessage(`🎁 获得【${def.name}】`, 'loot');
+              } else {
+                appendMessage('背包已满，物品丢失了……', 'combat');
+              }
+            }
+
+            // Special: reveal map
+            if (deal.offer === '全图透视') {
+              const map = this.state.map;
+              if (map) {
+                for (const r of map.rooms) {
+                  r.explored = true;
+                }
+                appendMessage('👁️ 整层地图已显现。', 'loot');
+              }
+            }
+
+            // Karma: demon deals are dark choices
+            this.state.karma -= 10;
+            this.state.karmaHistory.push({
+              nodeId: this.state.currentNodeId ?? 'dungeon',
+              choiceId: `demon_deal_${deal.item ?? deal.offer}`,
+              karmaChange: -10,
+              day: this.state.day,
+            });
+            appendMessage('⚖️ 因果 -10（与暗影交易）', 'system');
+
+            room.cleared = true;
+            updateStatusBar(this.state);
+            this.showMapView();
+          });
         },
       });
     }
@@ -1685,10 +2555,10 @@ export class Game {
           if (enemy) {
             // Surprise attack: lose HP first
             const surprise = rand(3, 6);
-            this.state.hp -= surprise;
+            this.state.party[0].hp -= surprise;
             appendMessage(`⚠️ 偷袭！你受到了 ${surprise} 点伤害！`, 'combat');
             updateStatusBar(this.state);
-            if (this.state.hp <= 0) { this.onDeath(); return; }
+            if (this.state.party[0].hp <= 0) { this.onDeath(); return; }
 
             this.startCombat(enemy, enemy.hp, roomIdx, (escaped) => {
               if (!escaped) room.cleared = true;
@@ -1731,7 +2601,7 @@ export class Game {
             ]);
           } else {
             appendMessage('看起来没什么异常。', 'narrator');
-            this.state.hp = Math.min(this.state.maxHp, this.state.hp + 5);
+            this.state.party[0].hp = Math.min(this.state.party[0].maxHp, this.state.party[0].hp + 5);
             appendMessage('你安心地休息了一会儿。❤️ +5', 'loot');
             room.cleared = true;
             updateStatusBar(this.state);
@@ -1834,7 +2704,23 @@ export class Game {
     ]);
   }
 
-  // ==================== COMBAT ====================
+  // ==================== COMBAT (Phase 3: Party-based NvM) ====================
+
+  /**
+   * Combat actor — represents either a party member or an enemy in turn order.
+   * Status effects (poison, stun, shield, weaken) are stored per-actor.
+   */
+  private _combatEnemy: {
+    id: string; name: string; desc: string;
+    currentHp: number; maxHp: number; attack: number; defense: number;
+    speed: number; goldDrop: [number, number]; lootChance: number;
+    abilities?: EnemyAbility[];
+    // Per-enemy state (FIX C2: no shared closure vars)
+    charging: boolean; stunned: boolean;
+    weakenTurns: number;
+    /** Poison ON the enemy (e.g. from corrode affix) */
+    poisonTurns: number; poisonDmg: number;
+  } | null = null;
 
   private startCombat(
     enemyData: EnemyData,
@@ -1842,59 +2728,135 @@ export class Game {
     roomIdx: number,
     onEnd: (escaped: boolean) => void,
   ) {
-    const enemy = { ...enemyData, currentHp: Math.min(startHp, enemyData.hp), maxHp: enemyData.hp };
+    // Build enemy combat object with per-actor status
+    const enemy = {
+      ...enemyData,
+      currentHp: Math.min(startHp, enemyData.hp),
+      maxHp: enemyData.hp,
+      speed: 8 + rand(-2, 2),
+      charging: false,
+      stunned: false,
+      weakenTurns: 0,
+      poisonTurns: 0,
+      poisonDmg: 0,
+    };
+    this._combatEnemy = enemy;
+
+    // Per-party-member combat state
+    const memberState: Record<string, {
+      shieldActive: boolean;
+      /** Poison on this party member (from enemy abilities) */
+      poisonTurns: number; poisonDmg: number;
+    }> = {};
+    for (const m of this.state.party) {
+      memberState[m.id] = { shieldActive: false, poisonTurns: 0, poisonDmg: 0 };
+    }
+
     let turn = 1;
-    let poisonTurns = 0;
-    let poisonDmg = 0;
-    let enemyCharging = false;
-    let enemyStunned = false;
-    let shieldActive = false;
-    let weakenTurns = 0;
     const skillCooldowns: Record<string, number> = {};
 
     showCombatScreen(enemy.name, enemy.desc);
-    updateCombatBars(enemy.currentHp, enemy.maxHp, this.state.hp, this.state.maxHp);
-    appendCombatMsg(`—— 战斗开始 ——`, 'info');
 
     // Darksight: show enemy HP values
     if (this.state.activeMutation === 'darksight') {
       appendCombatMsg(`👁️ 暗视觉：${enemy.name} HP ${enemy.currentHp}/${enemy.maxHp} ATK ${enemy.attack} DEF ${enemy.defense}`, 'info');
     }
 
+    // Phase 8: Boss weakness system
+    const bossWeakness = Object.values(BOSS_WEAKNESSES).find(w => w.bossId === enemy.id);
+    const weaknessDiscovered = bossWeakness && this.state.discoveredWeaknesses.includes(bossWeakness.id);
+    if (bossWeakness && !weaknessDiscovered) {
+      // Undiscovered: boss gets 150% HP
+      enemy.maxHp = Math.ceil(enemy.maxHp * 1.5);
+      enemy.currentHp = Math.min(enemy.currentHp, enemy.maxHp);
+      appendCombatMsg(`⚠️ ${enemy.name}散发着强大的威压！（未发现弱点，HP x1.5）`, 'info');
+    } else if (bossWeakness && weaknessDiscovered) {
+      appendCombatMsg(`💡 你已掌握${enemy.name}的弱点：${bossWeakness.name}`, 'info');
+      if (bossWeakness.effectType === 'item') {
+        appendCombatMsg(`  使用${ITEMS[bossWeakness.effectValue]?.name ?? bossWeakness.effectValue}可造成${bossWeakness.damageMultiplier}倍伤害`, 'info');
+      } else if (bossWeakness.effectType === 'skill') {
+        appendCombatMsg(`  使用技能${SKILLS[bossWeakness.effectValue]?.name ?? bossWeakness.effectValue}可造成${bossWeakness.damageMultiplier}倍伤害`, 'info');
+      }
+    }
+
     const exitCombat = () => {
       hideCombatScreen();
+      this._combatEnemy = null;
     };
 
+    const aliveParty = () => this.state.party.filter(m => m.isAlive && m.hp > 0);
+
     const refreshBars = () => {
-      updateCombatBars(enemy.currentHp, enemy.maxHp, this.state.hp, this.state.maxHp);
+      updateEnemyBars([{ id: enemy.id, name: enemy.name, currentHp: enemy.currentHp, maxHp: enemy.maxHp }]);
+      updatePartyBars(this.state.party);
       updateStatusBar(this.state);
     };
 
-    const applyPoison = () => {
-      if (poisonTurns > 0) {
-        const pd = calcDamageTaken(this.state, poisonDmg);
-        this.state.hp -= pd;
-        poisonTurns--;
-        appendCombatMsg(`☠️ 毒素伤害 -${pd} HP${poisonTurns > 0 ? ` (剩余${poisonTurns}回合)` : ' (毒素消散)'}`, 'atk-enemy');
-        refreshBars();
+    refreshBars();
+    appendCombatMsg(`—— 战斗开始 ——`, 'info');
+
+    // ── Build turn order by speed ──
+    const buildTurnOrder = (): Array<{ type: 'party'; member: PartyMember } | { type: 'enemy' }> => {
+      const actors: Array<{ type: 'party'; member: PartyMember; speed: number } | { type: 'enemy'; speed: number }> = [];
+      for (const m of aliveParty()) {
+        actors.push({ type: 'party', member: m, speed: m.speed + rand(-1, 1) });
       }
+      actors.push({ type: 'enemy', speed: enemy.speed ?? (enemy.attack + rand(0, 3)) });
+      actors.sort((a, b) => b.speed - a.speed);
+      return actors;
     };
 
+    // ── Check if party is wiped ──
+    const isPartyWiped = (): boolean => aliveParty().length === 0;
+
+    const showDeathUI = () => {
+      appendCombatMsg(`全队覆没……`, 'result');
+      setCombatActions([{
+        text: '💀 …',
+        danger: true,
+        callback: () => { exitCombat(); this.onDeath(); },
+      }]);
+    };
+
+    // ── Apply poison to a party member at start of their turn ──
+    const applyMemberPoison = (m: PartyMember) => {
+      const ms = memberState[m.id];
+      if (!ms || ms.poisonTurns <= 0) return;
+      const pd = calcDamageTaken(this.state, ms.poisonDmg);
+      m.hp -= pd;
+      ms.poisonTurns--;
+      appendCombatMsg(`☠️ ${m.name} 毒素伤害 -${pd} HP${ms.poisonTurns > 0 ? ` (剩余${ms.poisonTurns}回合)` : ' (毒素消散)'}`, 'atk-enemy');
+      if (m.hp <= 0) {
+        m.hp = 0;
+        m.isAlive = false;
+        appendCombatMsg(`💀 ${m.name} 倒下了！`, 'result');
+      }
+      refreshBars();
+    };
+
+    // ── Apply poison to enemy at start of enemy turn ──
+    const applyEnemyPoison = () => {
+      if (enemy.poisonTurns <= 0) return;
+      const pd = enemy.poisonDmg;
+      enemy.currentHp -= pd;
+      enemy.poisonTurns--;
+      appendCombatMsg(`☠️ ${enemy.name} 中毒伤害 -${pd} HP${enemy.poisonTurns > 0 ? ` (剩余${enemy.poisonTurns}回合)` : ' (毒素消散)'}`, 'atk-player');
+      refreshBars();
+    };
+
+    // ── onEnemyKill: rewards and loot ──
     const onEnemyKill = () => {
       appendCombatMsg(`${enemy.name}倒下了！`, 'result');
 
-      // Run stats
       if (this.runStats) this.runStats.kills++;
       this.state.lifetimeKills++;
 
-      // Gold drop
       const gold = rand(enemy.goldDrop[0], enemy.goldDrop[1]);
       this.state.gold += gold;
       this.state.lifetimeGold += gold;
       if (this.runStats) this.runStats.goldEarned += gold;
       appendCombatMsg(`💰 +${gold} 金币`, 'result');
 
-      // Loot drop
       let lootMultiplier = 1;
       if (this.state.activeMutation === 'bloodlust') lootMultiplier = 1.5;
 
@@ -1908,35 +2870,44 @@ export class Game {
         }
       }
 
-      // Bloodlust mutation: heal 15% maxHP on kill
+      // Bloodlust mutation: heal protagonist 15% maxHP on kill
       if (this.state.activeMutation === 'bloodlust') {
-        const heal = Math.ceil(this.state.maxHp * 0.15);
-        this.state.hp = Math.min(this.state.maxHp, this.state.hp + heal);
-        appendCombatMsg(`🩸 嗜血本能：❤️ +${heal}`, 'result');
+        const p = this.state.party[0];
+        if (p.isAlive) {
+          const heal = Math.ceil(p.maxHp * 0.15);
+          p.hp = Math.min(p.maxHp, p.hp + heal);
+          appendCombatMsg(`🩸 嗜血本能：❤️ +${heal}`, 'result');
+        }
       }
 
       // Lifesteal charm
       if (hasItem(this.state, 'lifesteal_charm')) {
-        this.state.hp = Math.min(this.state.maxHp, this.state.hp + 10);
-        appendCombatMsg(`✨ 生命虹吸：❤️ +10`, 'result');
+        const p = this.state.party[0];
+        if (p.isAlive) {
+          p.hp = Math.min(p.maxHp, p.hp + 10);
+          appendCombatMsg(`✨ 生命虹吸：❤️ +10`, 'result');
+        }
       }
 
-      // Track quest kills (strip elite_ prefix)
+      // Track quest kills
       const baseEnemyId = enemy.id.startsWith('elite_') ? enemy.id.slice(6) : enemy.id;
       if (this.state.activeQuests.length > 0) {
         this.state.questKills[baseEnemyId] = (this.state.questKills[baseEnemyId] ?? 0) + 1;
       }
 
-      // Boss kill: award skill points
-      const isBoss = enemy.id === 'warlord' || enemy.id === 'mutant_king' || enemy.id === 'ark_guardian';
+      // Boss kill: award skill points (FIX M3: use isBoss flag or known boss IDs)
+      const isBoss = enemy.id === 'warlord' || enemy.id === 'mutant_king' || enemy.id === 'ark_guardian'
+        || enemy.id === 'mutant_queen' || enemy.id === 'ark_overseer';
       if (isBoss) {
         this.state.lifetimeBossKills++;
-        const spGain = enemy.id === 'ark_guardian' ? 3 : enemy.id === 'mutant_king' ? 2 : 1;
+        const spGain = (enemy.id === 'ark_guardian' || enemy.id === 'ark_overseer') ? 3
+          : (enemy.id === 'mutant_king' || enemy.id === 'mutant_queen') ? 2 : 1;
         this.state.skillPoints += spGain;
+        this.state.party[0].sp += spGain;
         appendCombatMsg(`🌟 Boss击杀！获得 ${spGain} 技能点`, 'result');
       }
 
-      // Small chance to discover exploration skill (8%, 15% on boss kill)
+      // Discover exploration skill
       const discoverChance = isBoss ? 0.15 : 0.08;
       if (Math.random() < discoverChance) {
         const available = EXPLORATION_SKILLS.filter(id => !this.state.skills.includes(id));
@@ -1948,9 +2919,20 @@ export class Game {
         }
       }
 
+      // MP recovery on victory: +5 MP to all alive members
+      for (const m of aliveParty()) {
+        m.mp = Math.min(m.maxMp, m.mp + 5);
+      }
+
+      // Exp gain: base 5 + enemy HP/2, boss x3
+      const expGain = Math.ceil((5 + enemy.maxHp / 2) * (isBoss ? 3 : 1));
+      this.state.party[0].exp += expGain;
+      appendCombatMsg(`📊 获得 ${expGain} 经验值`, 'result');
+      this.checkJobLevelUp();
+
       refreshBars();
 
-      // Greedy loot option
+      // Victory options
       setCombatActions([
         {
           text: '✅ 继续探索',
@@ -1964,120 +2946,33 @@ export class Game {
         {
           text: '🔍 搜刮尸体',
           callback: () => {
-            const roll = Math.random();
-            const finishLoot = () => {
-              refreshBars();
-              setCombatActions([{
-                text: '✅ 继续探索',
-                primary: true,
-                callback: () => {
-                  exitCombat();
-                  appendMessage(`🏆 击败了${enemy.name}！`, 'loot');
-                  onEnd(false);
-                },
-              }]);
-            };
-
-            if (roll < 0.35) {
-              // Normal extra loot
-              const bonusGold = rand(5, 15);
-              this.state.gold += bonusGold;
-              appendCombatMsg(`💰 额外搜到了 +${bonusGold} 金币！`, 'result');
-              const bonusLoot = rollLoot(this.state.floor);
-              if (addItem(this.state, bonusLoot)) {
-                appendCombatMsg(`🎁 还找到了【${ITEMS[bonusLoot].name}】！`, 'result');
-              }
-              finishLoot();
-            } else if (roll < 0.50) {
-              // Find journal fragment
-              const available = JOURNAL_ENTRIES.filter(
-                j => this.state.floor >= j.minFloor && !this.state.journalEntries.includes(j.id)
-              );
-              if (available.length > 0) {
-                const entry = pick(available);
-                this.state.journalEntries.push(entry.id);
-                appendCombatMsg(`📜 在尸体旁发现了一份记录：【${entry.title}】`, 'result');
-              } else {
-                const g = rand(3, 10);
-                this.state.gold += g;
-                appendCombatMsg(`搜了半天只找到 ${g} 金币。`, 'result');
-              }
-              finishLoot();
-            } else if (roll < 0.65) {
-              // Find recipe hint
-              const unknownRecipes = Object.keys(RECIPES).filter(
-                r => !this.state.knownRecipes.includes(r)
-              );
-              if (unknownRecipes.length > 0) {
-                const recipeId = pick(unknownRecipes);
-                this.state.knownRecipes.push(recipeId);
-                const recipe = RECIPES[recipeId];
-                appendCombatMsg(`📋 在口袋里发现了制作笔记：${recipe.name}！`, 'result');
-              } else {
-                const g = rand(5, 12);
-                this.state.gold += g;
-                appendCombatMsg(`口袋里只有 ${g} 金币。`, 'result');
-              }
-              finishLoot();
-            } else if (roll < 0.75) {
-              // Nothing useful
-              appendCombatMsg('翻遍了全身，什么值钱的东西都没有。', 'info');
-              finishLoot();
-            } else if (roll < 0.85) {
-              // Trap: minor damage
-              const trapDmg = rand(2, 4);
-              this.state.hp -= trapDmg;
-              appendCombatMsg(`尸体上绑着一根细线——是陷阱！💔 HP -${trapDmg}`, 'atk-enemy');
-              if (this.state.hp <= 0) {
-                appendCombatMsg('你失去了意识……', 'result');
-                setCombatActions([{
-                  text: '💀 …',
-                  danger: true,
-                  callback: () => { exitCombat(); this.onDeath(); },
-                }]);
-                return;
-              }
-              finishLoot();
-            } else {
-              // Ambush (15%)
-              appendCombatMsg('⚠️ 你搜刮得太入迷，另一个敌人偷袭了你！', 'atk-enemy');
-              const ambushDmg = rand(3, 6);
-              this.state.hp -= ambushDmg;
-              appendCombatMsg(`💔 HP -${ambushDmg}`, 'atk-enemy');
-              refreshBars();
-              if (this.state.hp <= 0) {
-                appendCombatMsg('你失去了意识……', 'result');
-                setCombatActions([{
-                  text: '💀 …',
-                  danger: true,
-                  callback: () => { exitCombat(); this.onDeath(); },
-                }]);
-                return;
-              }
-              setCombatActions([{
-                text: '✅ 赶紧离开',
-                primary: true,
-                callback: () => {
-                  exitCombat();
-                  appendMessage(`🏆 击败了${enemy.name}，但被偷袭受伤了。`, 'loot');
-                  onEnd(false);
-                },
-              }]);
-            }
+            this.lootCorpse(enemy, refreshBars, exitCombat, onEnd);
           },
         },
       ]);
     };
 
-    const enemyTurn = () => {
+    // ── Enemy turn (FIX M1: enemy acts on its own turn, not coupled to defend) ──
+    const doEnemyTurn = () => {
       // Stun check
-      if (enemyStunned) {
-        enemyStunned = false;
+      if (enemy.stunned) {
+        enemy.stunned = false;
         appendCombatMsg(`💫 ${enemy.name}处于眩晕状态，无法行动！`, 'info');
         return;
       }
 
-      const playerDef = getDefense(this.state, ITEMS);
+      // Apply enemy's own poison at turn start
+      applyEnemyPoison();
+      if (enemy.currentHp <= 0) {
+        onEnemyKill();
+        return;
+      }
+
+      // Pick a random alive target
+      const alive = aliveParty();
+      if (alive.length === 0) return;
+      const target = alive[Math.floor(Math.random() * alive.length)];
+      const targetDef = getDefense(this.state, ITEMS);
       let totalDmg = 0;
 
       // Process enemy abilities
@@ -2085,17 +2980,21 @@ export class Game {
         for (const ability of enemy.abilities) {
           if (Math.random() >= ability.chance) continue;
 
-          if (ability.type === 'charge' && !enemyCharging) {
-            enemyCharging = true;
+          if (ability.type === 'charge' && !enemy.charging) {
+            enemy.charging = true;
             appendCombatMsg(`⚡ ${enemy.name}开始蓄力——${ability.name}！`, 'atk-enemy');
             refreshBars();
             return;
           }
 
           if (ability.type === 'poison') {
-            poisonDmg = ability.poisonDmg ?? 2;
-            poisonTurns = ability.poisonDuration ?? 2;
-            appendCombatMsg(`☠️ ${enemy.name}使用了${ability.name}！你中毒了！(${poisonDmg}伤害/回合, ${poisonTurns}回合)`, 'atk-enemy');
+            // FIX C2: poison is stored on the TARGET member, not shared closure
+            const ms = memberState[target.id];
+            if (ms) {
+              ms.poisonDmg = ability.poisonDmg ?? 2;
+              ms.poisonTurns = ability.poisonDuration ?? 2;
+            }
+            appendCombatMsg(`☠️ ${enemy.name}使用了${ability.name}！${target.name}中毒了！(${ms?.poisonDmg ?? 2}伤害/回合, ${ms?.poisonTurns ?? 2}回合)`, 'atk-enemy');
           }
 
           if (ability.type === 'summon') {
@@ -2107,21 +3006,21 @@ export class Game {
         }
       }
 
-      // Weaken debuff: halve enemy attack
+      // Weaken debuff
       let enemyAtk = enemy.attack;
-      if (weakenTurns > 0) {
+      if (enemy.weakenTurns > 0) {
         enemyAtk = Math.floor(enemyAtk * 0.5);
-        weakenTurns--;
-        appendCombatMsg(`📣 战吼效果：${enemy.name}攻击力减半${weakenTurns > 0 ? ` (剩余${weakenTurns}回合)` : ' (消散)'}`, 'info');
+        enemy.weakenTurns--;
+        appendCombatMsg(`📣 战吼效果：${enemy.name}攻击力减半${enemy.weakenTurns > 0 ? ` (剩余${enemy.weakenTurns}回合)` : ' (消散)'}`, 'info');
       }
 
-      // Normal attack (or charged attack)
+      // Charged attack
       let atkMultiplier = 1;
-      if (enemyCharging) {
+      if (enemy.charging) {
         const chargeAbility = enemy.abilities?.find(a => a.type === 'charge');
         atkMultiplier = chargeAbility?.chargeMultiplier ?? 2;
         appendCombatMsg(`💥 ${enemy.name}释放了蓄力攻击！`, 'atk-enemy');
-        enemyCharging = false;
+        enemy.charging = false;
       }
 
       // Enemy crit (10%)
@@ -2132,57 +3031,126 @@ export class Game {
       }
 
       const rawAtkValue = Math.floor(enemyAtk * atkMultiplier) + rand(-1, 1);
-      const rawDmg = applyDefense(rawAtkValue, playerDef);
+      const rawDmg = applyDefense(rawAtkValue, targetDef);
       let eDmg = calcDamageTaken(this.state, rawDmg);
 
-      // Build damage breakdown
       const details: string[] = [];
-      if (playerDef > 0) details.push(`🛡️-${rawAtkValue - rawDmg}`);
+      if (targetDef > 0) details.push(`🛡️-${rawAtkValue - rawDmg}`);
       if (this.state.activeMutation === 'iron') details.push('铁皮-40%');
       if (this.state.activeMutation === 'darksight') details.push('暗视+1');
 
-      // Shield from iron_wall skill (synergy: iron mutation = 70%)
-      if (shieldActive) {
+      // Shield from iron_wall skill
+      const ms = memberState[target.id];
+      if (ms?.shieldActive) {
         const shieldReduction = this.state.activeMutation === 'iron' ? 0.3 : 0.5;
         eDmg = Math.max(1, Math.floor(eDmg * shieldReduction));
-        shieldActive = false;
+        ms.shieldActive = false;
         details.push(this.state.activeMutation === 'iron' ? '铁壁-70%' : '铁壁-50%');
       }
 
       totalDmg += eDmg;
+      target.hp -= totalDmg;
 
-      this.state.hp -= totalDmg;
       const detailStr = details.length > 0 ? ` (${details.join(' ')})` : '';
+      const targetLabel = this.state.party.length > 1 ? `${target.name}` : '你';
       if (enemyCrit) {
-        appendCombatMsg(`💥 暴击！${enemy.name}攻击，你受到 ${totalDmg} 点伤害${detailStr}`, 'atk-enemy');
+        appendCombatMsg(`💥 暴击！${enemy.name}攻击${targetLabel}，造成 ${totalDmg} 点伤害${detailStr}`, 'atk-enemy');
       } else {
-        appendCombatMsg(`← ${enemy.name}攻击，你受到 ${totalDmg} 点伤害${detailStr}`, 'atk-enemy');
+        appendCombatMsg(`← ${enemy.name}攻击${targetLabel}，造成 ${totalDmg} 点伤害${detailStr}`, 'atk-enemy');
       }
+
+      if (target.hp <= 0) {
+        target.hp = 0;
+        target.isAlive = false;
+        appendCombatMsg(`💀 ${target.name} 倒下了！`, 'result');
+      }
+
       refreshBars();
     };
 
+    // ── Tick cooldowns ──
     const tickCooldowns = () => {
       for (const sid of Object.keys(skillCooldowns)) {
         if (skillCooldowns[sid] > 0) skillCooldowns[sid]--;
       }
     };
 
-    const showCombatUI = (showTurnHeader = true) => {
-      // Tick skill cooldowns at start of each turn
-      if (showTurnHeader) tickCooldowns();
-      // Apply poison at start of player's turn
-      applyPoison();
-      if (this.state.hp <= 0) {
-        appendCombatMsg(`毒素夺走了你最后的力量……`, 'result');
-        setCombatActions([{
-          text: '💀 …',
-          danger: true,
-          callback: () => { exitCombat(); this.onDeath(); },
-        }]);
-        return;
-      }
+    // ── Run one full round (all actors take turns in speed order) ──
+    const runRound = () => {
+      const turnOrder = buildTurnOrder();
+      let actorIdx = 0;
 
-      if (showTurnHeader) appendCombatMsg(`—— 第 ${turn} 回合 ——`, 'info');
+      const nextActor = () => {
+        // Check victory/defeat before proceeding
+        if (enemy.currentHp <= 0) {
+          onEnemyKill();
+          return;
+        }
+        if (isPartyWiped()) {
+          showDeathUI();
+          return;
+        }
+
+        if (actorIdx >= turnOrder.length) {
+          // Round complete — start next round
+          turn++;
+          tickCooldowns();
+          // MP regen: +2 MP per round for alive members
+          for (const m of aliveParty()) {
+            m.mp = Math.min(m.maxMp, m.mp + 2);
+          }
+          runRound();
+          return;
+        }
+
+        const actor = turnOrder[actorIdx];
+        actorIdx++;
+
+        if (actor.type === 'enemy') {
+          // Enemy's independent turn (FIX M1)
+          doEnemyTurn();
+          if (enemy.currentHp <= 0) {
+            onEnemyKill();
+            return;
+          }
+          if (isPartyWiped()) {
+            showDeathUI();
+            return;
+          }
+          nextActor();
+        } else {
+          // Party member's turn
+          const member = actor.member;
+          if (!member.isAlive || member.hp <= 0) {
+            nextActor();
+            return;
+          }
+
+          // Apply poison at start of this member's turn
+          applyMemberPoison(member);
+          if (!member.isAlive || member.hp <= 0) {
+            if (isPartyWiped()) { showDeathUI(); return; }
+            nextActor();
+            return;
+          }
+
+          showMemberCombatUI(member, nextActor);
+        }
+      };
+
+      appendCombatMsg(`—— 第 ${turn} 回合 ——`, 'info');
+      nextActor();
+    };
+
+    // ── Show combat UI for a specific party member ──
+    const showMemberCombatUI = (
+      member: PartyMember,
+      onTurnEnd: () => void,
+    ) => {
+      // Highlight active member
+      updatePartyBars(this.state.party, this.state.party.indexOf(member));
+
+      const memberLabel = this.state.party.length > 1 ? `${member.name}` : '你';
       const playerAtk = getAttack(this.state, ITEMS);
 
       const combatActions: ActionButton[] = [
@@ -2190,33 +3158,19 @@ export class Game {
           text: '⚔️ 攻击',
           primary: true,
           callback: () => {
-            const isLowHp = this.state.hp < this.state.maxHp * 0.2;
+            const isLowHp = member.hp < member.maxHp * 0.2;
 
-            // Desperate attack trigger (25% when HP < 20%)
+            // Desperate attack (25% when HP < 20%)
             if (isLowHp && Math.random() < 0.25) {
               const dmg = Math.max(1, applyDefense(playerAtk + rand(-1, 2), enemy.defense) * 3);
               enemy.currentHp -= dmg;
-              appendCombatMsg(`🔥 濒死一击！造成 ${dmg} 点伤害！`, 'atk-player');
+              appendCombatMsg(`🔥 ${memberLabel}发动濒死一击！造成 ${dmg} 点伤害！`, 'atk-player');
               refreshBars();
-              if (enemy.currentHp <= 0) {
-                onEnemyKill();
-                return;
-              }
-              enemyTurn();
-              if (this.state.hp <= 0) {
-                appendCombatMsg(`你失去了意识……`, 'result');
-                setCombatActions([{
-                  text: '💀 …', danger: true,
-                  callback: () => { exitCombat(); this.onDeath(); },
-                }]);
-                return;
-              }
-              turn++;
-              showCombatUI();
+              onTurnEnd();
               return;
             }
 
-            // Player crit (15% + precise affix 10%)
+            // Crit (15% + precise affix 10%)
             let critChance = 0.15;
             if (this.state.equippedWeaponAffix === 'precise') critChance += 0.1;
             let critMultiplier = 1;
@@ -2226,9 +3180,9 @@ export class Game {
               isCrit = true;
             }
 
-            // Dodge (8% enemy dodge)
+            // Dodge (8%)
             if (Math.random() < 0.08) {
-              appendCombatMsg(`→ ${enemy.name}闪避了你的攻击！`, 'info');
+              appendCombatMsg(`→ ${enemy.name}闪避了${memberLabel}的攻击！`, 'info');
             } else {
               const rawPlayerAtk = playerAtk + rand(-1, 2);
               const afterDef = applyDefense(rawPlayerAtk, enemy.defense);
@@ -2240,131 +3194,103 @@ export class Game {
               if (this.state.activeMutation === 'flesh') pDetails.push('血肉+50%');
               const pDetailStr = pDetails.length > 0 ? ` (${pDetails.join(' ')})` : '';
               if (isCrit) {
-                appendCombatMsg(`💥 暴击！你攻击了${enemy.name}，造成 ${dmg} 点伤害${pDetailStr}`, 'atk-player');
+                appendCombatMsg(`💥 暴击！${memberLabel}攻击了${enemy.name}，造成 ${dmg} 点伤害${pDetailStr}`, 'atk-player');
               } else {
-                appendCombatMsg(`→ 你攻击了${enemy.name}，造成 ${dmg} 点伤害${pDetailStr}`, 'atk-player');
+                appendCombatMsg(`→ ${memberLabel}攻击了${enemy.name}，造成 ${dmg} 点伤害${pDetailStr}`, 'atk-player');
               }
 
-              // Weapon affix effects on hit
+              // Weapon affix effects on hit — FIX C2: corrode poisons the ENEMY, not player
               if (this.state.equippedWeaponAffix === 'corrode' && dmg > 0) {
-                poisonDmg = 2; poisonTurns = 2;
+                enemy.poisonDmg = 2;
+                enemy.poisonTurns = 2;
                 appendCombatMsg(`🧪 腐蚀词缀：${enemy.name}被腐蚀了！(2伤害/回合, 2回合)`, 'info');
               }
               if (this.state.equippedWeaponAffix === 'vampiric' && dmg > 0) {
                 const vHeal = Math.max(1, Math.floor(dmg * 0.1));
-                this.state.hp = Math.min(this.state.maxHp, this.state.hp + vHeal);
-                appendCombatMsg(`🩸 吸血词缀：回复 ${vHeal} HP`, 'info');
+                member.hp = Math.min(member.maxHp, member.hp + vHeal);
+                appendCombatMsg(`🩸 吸血词缀：${memberLabel}回复 ${vHeal} HP`, 'info');
               }
             }
             refreshBars();
-
-            if (enemy.currentHp <= 0) {
-              onEnemyKill();
-              return;
-            }
-
-            // Enemy turn
-            enemyTurn();
-
-            if (this.state.hp <= 0) {
-              appendCombatMsg(`你失去了意识……`, 'result');
-              setCombatActions([{
-                text: '💀 …',
-                danger: true,
-                callback: () => { exitCombat(); this.onDeath(); },
-              }]);
-              return;
-            }
-            turn++;
-            showCombatUI();
+            onTurnEnd();
           },
         },
         {
           text: '🛡️ 防御',
           callback: () => {
-            const playerDef = getDefense(this.state, ITEMS);
-            const rawReduced = applyDefense(enemy.attack + rand(-1, 1), playerDef * 2);
-            const reduced = calcDamageTaken(this.state, rawReduced);
-            this.state.hp -= reduced;
-            if (reduced === 0) {
-              appendCombatMsg(`→ 你严密防御，完全挡住了攻击！`, 'atk-player');
-            } else {
-              appendCombatMsg(`→ 你进行防御，仅受到 ${reduced} 点伤害`, 'atk-player');
-            }
+            // Defend: double defense for this member until next turn
+            const ms = memberState[member.id];
+            if (ms) ms.shieldActive = true;
+            appendCombatMsg(`→ ${memberLabel}进入防御姿态！`, 'atk-player');
             refreshBars();
-
-            if (this.state.hp <= 0) {
-              appendCombatMsg(`你失去了意识……`, 'result');
-              setCombatActions([{
-                text: '💀 …',
-                danger: true,
-                callback: () => { exitCombat(); this.onDeath(); },
-              }]);
-              return;
-            }
-            turn++;
-            showCombatUI();
+            // FIX M1: defend no longer triggers enemy turn — enemy has its own slot
+            onTurnEnd();
           },
         },
         {
           text: '💊 道具',
           callback: () => this.showCombatItems(
-            () => {
-              refreshBars();
-              enemyTurn();
-
-              if (this.state.hp <= 0) {
-                appendCombatMsg(`你失去了意识……`, 'result');
-                setCombatActions([{
-                  text: '💀 …',
-                  danger: true,
-                  callback: () => { exitCombat(); this.onDeath(); },
-                }]);
-                return;
+            (usedItemId) => {
+              // FIX C4: If item has combatDamage, deal it to the enemy
+              const itemDef = ITEMS[usedItemId];
+              if (itemDef?.combatDamage) {
+                let dmg = itemDef.combatDamage;
+                // Mechanical bonus (e.g. EMP grenade +30 vs mechanical enemies)
+                const isMech = enemy.id.includes('mech') || enemy.id.includes('robot')
+                  || enemy.id.includes('ark_') || enemy.id.includes('trap_mimic');
+                if (isMech && itemDef.combatDamageMech) {
+                  dmg += itemDef.combatDamageMech;
+                  appendCombatMsg(`⚡ 对机械目标额外造成 ${itemDef.combatDamageMech} 点伤害！`, 'info');
+                }
+                // Boss weakness: item matches weakness effectValue
+                if (bossWeakness && weaknessDiscovered && bossWeakness.effectType === 'item'
+                    && bossWeakness.effectValue === usedItemId) {
+                  dmg = Math.ceil(dmg * bossWeakness.damageMultiplier);
+                  appendCombatMsg(`💡 弱点命中！伤害 x${bossWeakness.damageMultiplier}！`, 'result');
+                }
+                enemy.currentHp -= dmg;
+                appendCombatMsg(`💥 ${itemDef.name}对${enemy.name}造成了 ${dmg} 点伤害！`, 'atk-player');
               }
-              turn++;
-              showCombatUI();
+              refreshBars();
+              onTurnEnd();
             },
-            () => { showCombatUI(false); },
+            () => { showMemberCombatUI(member, onTurnEnd); },
           ),
         },
       ];
 
-      // Skills
+      // Skills (use MP instead of cooldown-only)
       for (const skillId of this.state.skills) {
         const skill = SKILLS[skillId];
         if (!skill) continue;
         const cd = skillCooldowns[skillId] ?? 0;
-        const ready = cd <= 0;
+        const mpCost = skill.mpCost ?? Math.ceil(skill.cooldown * 3);
+        const hasEnoughMp = member.mp >= mpCost;
+        const ready = cd <= 0 && hasEnoughMp;
+        let label = `${skill.icon} ${skill.name}`;
+        if (cd > 0) label += ` (${cd}回合)`;
+        else if (!hasEnoughMp) label += ` (MP不足)`;
+        else label += ` (${mpCost}MP)`;
+
         combatActions.push({
-          text: ready ? `${skill.icon} ${skill.name}` : `${skill.icon} ${skill.name} (${cd}回合)`,
+          text: label,
           disabled: !ready,
           callback: () => {
+            member.mp -= mpCost;
             skillCooldowns[skillId] = skill.cooldown;
-            this.executeSkill(skill, enemy, playerAtk, refreshBars, appendCombatMsg, { enemyStunned });
+            this.executeSkill(skill, enemy, playerAtk, refreshBars, appendCombatMsg, { enemyStunned: enemy.stunned }, member,
+              bossWeakness ? { effectType: bossWeakness.effectType, effectValue: bossWeakness.effectValue, damageMultiplier: bossWeakness.damageMultiplier, discovered: !!weaknessDiscovered } : undefined);
 
-            if (enemy.currentHp <= 0) {
-              onEnemyKill();
-              return;
+            // Apply skill state to enemy
+            if (skill.effect.type === 'shield') {
+              const ms2 = memberState[member.id];
+              if (ms2) ms2.shieldActive = true;
             }
+            if (skill.effect.type === 'debuff') enemy.weakenTurns = skill.effect.turns;
+            if (skill.effect.type === 'stun') enemy.stunned = true;
 
-            // Apply skill-specific combat state
-            if (skill.effect.type === 'shield') shieldActive = true;
-            if (skill.effect.type === 'debuff') weakenTurns = skill.effect.turns;
-            if (skill.effect.type === 'stun') enemyStunned = true;
-
-            enemyTurn();
-
-            if (this.state.hp <= 0) {
-              appendCombatMsg(`你失去了意识……`, 'result');
-              setCombatActions([{
-                text: '💀 …', danger: true,
-                callback: () => { exitCombat(); this.onDeath(); },
-              }]);
-              return;
-            }
-            turn++;
-            showCombatUI();
+            refreshBars();
+            onTurnEnd();
           },
         });
       }
@@ -2377,10 +3303,9 @@ export class Game {
           callback: () => {
             const chance = getEscapeChance(this.state);
             if (Math.random() < chance) {
-              appendCombatMsg('你成功脱离了战斗！', 'result');
-              this.state.hunger -= 5;
+              appendCombatMsg('你们成功脱离了战斗！', 'result');
+              this.state.stamina -= 5;
 
-              // Save enemy state
               if (roomIdx >= 0) {
                 this.state.savedEnemies.push({
                   roomIdx,
@@ -2396,28 +3321,29 @@ export class Game {
                 callback: () => {
                   exitCombat();
                   appendMessage('你逃离了战斗。敌人仍在原地。', 'narrator');
-                  onEnd(true); // escaped=true, room not cleared
+                  onEnd(true);
                 },
               }]);
             } else {
-              // Fail: enemy free attack
-              const dmg = Math.max(1, enemy.attack + rand(0, 2));
-              const finalDmg = calcDamageTaken(this.state, dmg);
-              this.state.hp -= finalDmg;
-              appendCombatMsg(`逃跑失败！${enemy.name}趁机攻击，HP -${finalDmg}`, 'atk-enemy');
+              // FIX C3: escape failure damage goes through defense pipeline
+              const rawDmg = enemy.attack + rand(0, 2);
+              const afterDef = applyDefense(rawDmg, getDefense(this.state, ITEMS));
+              const finalDmg = calcDamageTaken(this.state, afterDef);
+              member.hp -= finalDmg;
+              appendCombatMsg(`逃跑失败！${enemy.name}趁机攻击${memberLabel}，HP -${finalDmg}`, 'atk-enemy');
+
+              if (member.hp <= 0) {
+                member.hp = 0;
+                member.isAlive = false;
+                appendCombatMsg(`💀 ${member.name} 倒下了！`, 'result');
+              }
               refreshBars();
 
-              if (this.state.hp <= 0) {
-                appendCombatMsg(`你失去了意识……`, 'result');
-                setCombatActions([{
-                  text: '💀 …',
-                  danger: true,
-                  callback: () => { exitCombat(); this.onDeath(); },
-                }]);
+              if (isPartyWiped()) {
+                showDeathUI();
                 return;
               }
-              turn++;
-              showCombatUI();
+              onTurnEnd();
             }
           },
         });
@@ -2432,74 +3358,184 @@ export class Game {
       setCombatActions(combatActions);
     };
 
-    showCombatUI();
+    // Start first round
+    runRound();
+  }
+
+  /** Loot corpse after enemy kill (extracted from closure for readability) */
+  private lootCorpse(
+    enemy: { id: string; name: string },
+    refreshBars: () => void,
+    exitCombat: () => void,
+    onEnd: (escaped: boolean) => void,
+  ) {
+    const roll = Math.random();
+    const finishLoot = () => {
+      refreshBars();
+      setCombatActions([{
+        text: '✅ 继续探索',
+        primary: true,
+        callback: () => {
+          exitCombat();
+          appendMessage(`🏆 击败了${enemy.name}！`, 'loot');
+          onEnd(false);
+        },
+      }]);
+    };
+
+    if (roll < 0.35) {
+      const bonusGold = rand(5, 15);
+      this.state.gold += bonusGold;
+      appendCombatMsg(`💰 额外搜到了 +${bonusGold} 金币！`, 'result');
+      const bonusLoot = rollLoot(this.state.floor);
+      if (addItem(this.state, bonusLoot)) {
+        appendCombatMsg(`🎁 还找到了【${ITEMS[bonusLoot].name}】！`, 'result');
+      }
+      finishLoot();
+    } else if (roll < 0.50) {
+      const available = JOURNAL_ENTRIES.filter(
+        j => this.state.floor >= j.minFloor && !this.state.journalEntries.includes(j.id)
+      );
+      if (available.length > 0) {
+        const entry = pick(available);
+        this.state.journalEntries.push(entry.id);
+        appendCombatMsg(`📜 在尸体旁发现了一份记录：【${entry.title}】`, 'result');
+      } else {
+        const g = rand(3, 10);
+        this.state.gold += g;
+        appendCombatMsg(`搜了半天只找到 ${g} 金币。`, 'result');
+      }
+      finishLoot();
+    } else if (roll < 0.65) {
+      const unknownRecipes = Object.keys(RECIPES).filter(
+        r => !this.state.knownRecipes.includes(r)
+      );
+      if (unknownRecipes.length > 0) {
+        const recipeId = pick(unknownRecipes);
+        this.state.knownRecipes.push(recipeId);
+        const recipe = RECIPES[recipeId];
+        appendCombatMsg(`📋 在口袋里发现了制作笔记：${recipe.name}！`, 'result');
+      } else {
+        const g = rand(5, 12);
+        this.state.gold += g;
+        appendCombatMsg(`口袋里只有 ${g} 金币。`, 'result');
+      }
+      finishLoot();
+    } else if (roll < 0.75) {
+      appendCombatMsg('翻遍了全身，什么值钱的东西都没有。', 'info');
+      finishLoot();
+    } else if (roll < 0.85) {
+      const trapDmg = rand(2, 4);
+      this.state.party[0].hp -= trapDmg;
+      appendCombatMsg(`尸体上绑着一根细线——是陷阱！💔 HP -${trapDmg}`, 'atk-enemy');
+      if (this.state.party[0].hp <= 0) {
+        this.state.party[0].hp = 0;
+        this.state.party[0].isAlive = false;
+        appendCombatMsg('你失去了意识……', 'result');
+        setCombatActions([{
+          text: '💀 …',
+          danger: true,
+          callback: () => { exitCombat(); this.onDeath(); },
+        }]);
+        return;
+      }
+      finishLoot();
+    } else {
+      appendCombatMsg('⚠️ 你搜刮得太入迷，另一个敌人偷袭了你！', 'atk-enemy');
+      const ambushDmg = rand(3, 6);
+      this.state.party[0].hp -= ambushDmg;
+      appendCombatMsg(`💔 HP -${ambushDmg}`, 'atk-enemy');
+      refreshBars();
+      if (this.state.party[0].hp <= 0) {
+        this.state.party[0].hp = 0;
+        this.state.party[0].isAlive = false;
+        appendCombatMsg('你失去了意识……', 'result');
+        setCombatActions([{
+          text: '💀 …',
+          danger: true,
+          callback: () => { exitCombat(); this.onDeath(); },
+        }]);
+        return;
+      }
+      setCombatActions([{
+        text: '✅ 赶紧离开',
+        primary: true,
+        callback: () => {
+          exitCombat();
+          appendMessage(`🏆 击败了${enemy.name}，但被偷袭受伤了。`, 'loot');
+          onEnd(false);
+        },
+      }]);
+    }
   }
 
   private executeSkill(
     skill: typeof SKILLS[string],
-    enemy: { currentHp: number; maxHp: number; defense: number; name: string },
+    enemy: { currentHp: number; maxHp: number; defense: number; name: string; stunned?: boolean },
     playerAtk: number,
     refreshBars: () => void,
     log: (text: string, type: 'atk-player' | 'atk-enemy' | 'info' | 'result') => void,
     synergy?: { enemyStunned: boolean },
+    actor?: PartyMember,
+    bossWeakness?: { effectType: string; effectValue: string; damageMultiplier: number; discovered: boolean },
   ) {
+    const member = actor ?? this.state.party[0];
     const eff = skill.effect;
     const mutation = this.state.activeMutation;
+    // Boss weakness skill multiplier
+    const weakMult = (bossWeakness?.discovered && bossWeakness.effectType === 'skill' && bossWeakness.effectValue === skill.id)
+      ? bossWeakness.damageMultiplier : 1;
+    if (weakMult > 1) log(`💡 弱点命中！伤害 x${weakMult}！`, 'result');
     switch (eff.type) {
       case 'damage': {
-        // Synergy: heavy_strike + flesh mutation = 3x instead of 2x
         let mult = eff.multiplier;
         if (skill.id === 'heavy_strike' && mutation === 'flesh') {
           mult = 3;
           log('🔥 血肉强化+重击联动！', 'info');
         }
-        const dmg = Math.max(1, Math.floor(applyDefense(playerAtk + rand(-1, 2), enemy.defense) * mult));
+        const dmg = Math.max(1, Math.floor(applyDefense(playerAtk + rand(-1, 2), enemy.defense) * mult * weakMult));
         enemy.currentHp -= dmg;
         log(`${skill.icon} ${skill.name}！造成 ${dmg} 点伤害`, 'atk-player');
         break;
       }
       case 'heal': {
-        const heal = Math.min(eff.amount, this.state.maxHp - this.state.hp);
-        this.state.hp += heal;
-        log(`${skill.icon} ${skill.name}！恢复 ${heal} HP`, 'atk-player');
+        const heal = Math.min(eff.amount, member.maxHp - member.hp);
+        member.hp += heal;
+        log(`${skill.icon} ${skill.name}！${member.name}恢复 ${heal} HP`, 'atk-player');
         break;
       }
       case 'debuff':
         log(`${skill.icon} ${skill.name}！${enemy.name}的攻击力被削弱了！`, 'atk-player');
         break;
       case 'shield': {
-        // Synergy: iron_wall + iron mutation = 70% reduction
         const shieldPct = mutation === 'iron' ? '70%' : '50%';
         if (mutation === 'iron') log('🔥 铁皮化+铁壁联动！减伤70%！', 'info');
-        log(`${skill.icon} ${skill.name}！下次受到的伤害将减${shieldPct}！`, 'atk-player');
+        log(`${skill.icon} ${skill.name}！${member.name}下次受到的伤害将减${shieldPct}！`, 'atk-player');
         break;
       }
       case 'drain': {
-        const dmg = Math.max(1, Math.floor(applyDefense(playerAtk + rand(-1, 2), enemy.defense) * eff.multiplier));
+        const dmg = Math.max(1, Math.floor(applyDefense(playerAtk + rand(-1, 2), enemy.defense) * eff.multiplier * weakMult));
         enemy.currentHp -= dmg;
-        // Synergy: blood_drain + bloodlust mutation = double heal
         let healAmount = dmg;
         if (mutation === 'bloodlust') {
           healAmount = dmg * 2;
           log('🔥 嗜血本能+吸血斩联动！回复翻倍！', 'info');
         }
-        const healed = Math.min(healAmount, this.state.maxHp - this.state.hp);
-        this.state.hp += healed;
-        log(`${skill.icon} ${skill.name}！造成 ${dmg} 伤害，回复 ${healed} HP`, 'atk-player');
+        const healed = Math.min(healAmount, member.maxHp - member.hp);
+        member.hp += healed;
+        log(`${skill.icon} ${skill.name}！造成 ${dmg} 伤害，${member.name}回复 ${healed} HP`, 'atk-player');
         break;
       }
       case 'execute': {
         const hpRatio = enemy.currentHp / enemy.maxHp;
-        // Synergy: execute + stunned enemy = threshold 50% instead of 30%
         let threshold = eff.hpThreshold;
         if (synergy?.enemyStunned) {
           threshold = 0.5;
           log('🔥 眩晕+处决联动！阈值提升至50%！', 'info');
         }
         if (hpRatio <= threshold) {
-          // Cap execute multiplier at 3x against bosses (maxHp >= 50)
           const execMult = enemy.maxHp >= 50 ? 3 : 5;
-          const dmg = Math.max(1, Math.floor(applyDefense(playerAtk + rand(-1, 2), enemy.defense) * execMult));
+          const dmg = Math.max(1, Math.floor(applyDefense(playerAtk + rand(-1, 2), enemy.defense) * execMult * weakMult));
           enemy.currentHp -= dmg;
           log(`${skill.icon} ${skill.name}！致命一击，造成 ${dmg} 点伤害！`, 'atk-player');
         } else {
@@ -2510,10 +3546,9 @@ export class Game {
         break;
       }
       case 'aoe': {
-        // Two hits
         let total = 0;
         for (let i = 0; i < 2; i++) {
-          const dmg = Math.max(1, Math.floor(applyDefense(playerAtk + rand(-1, 2), enemy.defense) * eff.multiplier));
+          const dmg = Math.max(1, Math.floor(applyDefense(playerAtk + rand(-1, 2), enemy.defense) * eff.multiplier * weakMult));
           enemy.currentHp -= dmg;
           total += dmg;
         }
@@ -2527,7 +3562,7 @@ export class Game {
     refreshBars();
   }
 
-  private showCombatItems(onUse: () => void, onCancel: () => void) {
+  private showCombatItems(onUse: (itemId: string) => void, onCancel: () => void) {
     // Regen mutation: can't use consumables
     if (!canUseConsumables(this.state)) {
       appendCombatMsg('🧬 再生体变异：无法使用消耗品！', 'info');
@@ -2551,12 +3586,14 @@ export class Game {
       let desc = def.name;
       if (def.hpRestore) desc += ` ❤️+${def.hpRestore}`;
       if (def.hungerRestore) desc += ` 🍖+${def.hungerRestore}`;
+      if (def.combatDamage) desc += ` 💥${def.combatDamage}`;
       return {
         text: `${desc} (x${inv.count})`,
         callback: () => {
-          this.useConsumable(inv.id);
+          const itemId = inv.id;
+          this.useConsumable(itemId);
           appendCombatMsg(`使用了【${def.name}】`, 'atk-player');
-          onUse();
+          onUse(itemId);
         },
       };
     });
@@ -2572,12 +3609,12 @@ export class Game {
     appendMessage(outcome.text, 'narrator');
 
     if (outcome.hp) {
-      this.state.hp = Math.max(0, Math.min(this.state.maxHp, this.state.hp + outcome.hp));
+      this.state.party[0].hp = Math.max(0, Math.min(this.state.party[0].maxHp, this.state.party[0].hp + outcome.hp));
       appendMessage(outcome.hp > 0 ? `❤️ +${outcome.hp} HP` : `💔 ${outcome.hp} HP`, outcome.hp > 0 ? 'loot' : 'combat');
     }
     if (outcome.hunger) {
-      this.state.hunger = Math.max(0, Math.min(this.state.maxHunger, this.state.hunger + outcome.hunger));
-      appendMessage(outcome.hunger > 0 ? `🍖 +${outcome.hunger} 饱食` : `😫 ${outcome.hunger} 饱食`, outcome.hunger > 0 ? 'loot' : 'combat');
+      this.state.stamina = Math.max(0, Math.min(this.state.maxStamina, this.state.stamina + outcome.hunger));
+      appendMessage(outcome.hunger > 0 ? `🍖 +${outcome.hunger} 体力` : `😫 ${outcome.hunger} 体力`, outcome.hunger > 0 ? 'loot' : 'combat');
     }
     if (outcome.gold) {
       this.state.gold = Math.max(0, this.state.gold + outcome.gold);
@@ -2592,6 +3629,19 @@ export class Game {
           appendMessage(`🎁 发现了【${def.name}】，但背包已满。`, 'combat');
         }
       }
+    }
+
+    // Karma from outcome
+    if (outcome.karma) {
+      this.state.karma += outcome.karma;
+      this.state.karmaHistory.push({
+        nodeId: this.state.currentNodeId ?? 'dungeon',
+        choiceId: 'event_choice',
+        karmaChange: outcome.karma,
+        day: this.state.day,
+      });
+      const label = outcome.karma > 0 ? `⚖️ 因果 +${outcome.karma}` : `⚖️ 因果 ${outcome.karma}`;
+      appendMessage(label, 'system');
     }
 
     // Mutation from outcome
@@ -2628,7 +3678,7 @@ export class Game {
       }
     }
 
-    if (this.state.hp <= 0) {
+    if (this.state.party[0].hp <= 0) {
       this.onDeath();
       return;
     }
@@ -2795,8 +3845,15 @@ export class Game {
       danger: true,
       callback: () => {
         removeItem(this.state, itemId);
-        if (this.state.equippedWeapon === itemId) this.state.equippedWeapon = null;
-        if (this.state.equippedArmor === itemId) this.state.equippedArmor = null;
+        // FIX M4: also clear affix when discarding equipped items
+        if (this.state.equippedWeapon === itemId) {
+          this.state.equippedWeapon = null;
+          this.state.equippedWeaponAffix = null;
+        }
+        if (this.state.equippedArmor === itemId) {
+          this.state.equippedArmor = null;
+          this.state.equippedArmorAffix = null;
+        }
         updateStatusBar(this.state);
         this.showInventory(context);
       },
@@ -2828,11 +3885,11 @@ export class Game {
 
     let msg = `使用了【${def.name}】`;
     if (def.hpRestore) {
-      this.state.hp = Math.min(this.state.maxHp, this.state.hp + def.hpRestore);
+      this.state.party[0].hp = Math.min(this.state.party[0].maxHp, this.state.party[0].hp + def.hpRestore);
       msg += ` ❤️+${def.hpRestore}`;
     }
     if (def.hungerRestore) {
-      this.state.hunger = Math.max(0, Math.min(this.state.maxHunger, this.state.hunger + def.hungerRestore));
+      this.state.stamina = Math.max(0, Math.min(this.state.maxStamina, this.state.stamina + def.hungerRestore));
       if (def.hungerRestore > 0) {
         msg += ` 🍖+${def.hungerRestore}`;
       } else {
@@ -2862,12 +3919,12 @@ export class Game {
       appendMessage('', 'divider');
       appendMessage(effect.text, 'event');
       if (effect.hp) {
-        this.state.hp = Math.max(0, Math.min(this.state.maxHp, this.state.hp + effect.hp));
+        this.state.party[0].hp = Math.max(0, Math.min(this.state.party[0].maxHp, this.state.party[0].hp + effect.hp));
         appendMessage(effect.hp > 0 ? `❤️ +${effect.hp}` : `💔 ${effect.hp} HP`, effect.hp > 0 ? 'loot' : 'combat');
       }
       if (effect.hunger) {
-        this.state.hunger = Math.max(0, Math.min(this.state.maxHunger, this.state.hunger + effect.hunger));
-        appendMessage(effect.hunger > 0 ? `🍖 +${effect.hunger}` : `😫 ${effect.hunger} 饱食`, effect.hunger > 0 ? 'loot' : 'combat');
+        this.state.stamina = Math.max(0, Math.min(this.state.maxStamina, this.state.stamina + effect.hunger));
+        appendMessage(effect.hunger > 0 ? `🍖 +${effect.hunger}` : `😫 ${effect.hunger} 体力`, effect.hunger > 0 ? 'loot' : 'combat');
       }
       if (effect.gold) {
         this.state.gold = Math.max(0, this.state.gold + effect.gold);
@@ -2883,7 +3940,7 @@ export class Game {
       }
     }
 
-    if (this.state.hp <= 0) {
+    if (this.state.party[0].hp <= 0) {
       this.onDeath();
       return;
     }
@@ -2977,7 +4034,7 @@ export class Game {
       callback: () => {
         appendMessage(choice.result, 'narrator');
         if (choice.hp) {
-          this.state.hp = Math.max(0, Math.min(this.state.maxHp, this.state.hp + choice.hp));
+          this.state.party[0].hp = Math.max(0, Math.min(this.state.party[0].maxHp, this.state.party[0].hp + choice.hp));
           appendMessage(choice.hp > 0 ? `❤️ +${choice.hp}` : `💔 ${choice.hp} HP`, choice.hp > 0 ? 'loot' : 'combat');
         }
         if (choice.gold) {
@@ -3031,6 +4088,18 @@ export class Game {
     hideHomeButton();
     clearMessages();
     appendMessage('你沿原路返回了营地。', 'narrator');
+
+    // Mark current node as cleared if it was a dungeon
+    const nodeId = this.state.currentNodeId;
+    if (nodeId && nodeId !== 'camp' && !this.state.clearedNodeIds.includes(nodeId)) {
+      const node = WORLD_NODES[nodeId];
+      // Only mark as cleared if it's not a boss_lair or if boss is already dead
+      if (node && node.type !== 'boss_lair') {
+        this.state.clearedNodeIds.push(nodeId);
+        this.refreshNodeUnlocks();
+      }
+    }
+    this.state.currentNodeId = 'camp';
 
     // Show exploration summary
     if (this.runStats) {
@@ -3095,10 +4164,10 @@ export class Game {
     actions.push({
       text: '🔄 回到营地',
       callback: () => {
-        this.state.maxHp = this.state.maxHpBase + this.state.baseLevel.shelter * 5;
-        this.state.hp = this.state.maxHp;
-        this.state.maxHunger = 100 + this.state.baseLevel.kitchen * 15;
-        this.state.hunger = this.state.maxHunger;
+        this.state.party[0].maxHp = this.state.maxHpBase + this.state.baseLevel.shelter * 5;
+        this.state.party[0].hp = this.state.party[0].maxHp;
+        this.state.maxStamina = 100 + this.state.baseLevel.kitchen * 15;
+        this.state.stamina = this.state.maxStamina;
         this.state.gold = keptGold;
         this.state.floor = 1;
         this.state.map = null;
@@ -3124,9 +4193,9 @@ export class Game {
 
   private revive() {
     // Revive with 30% HP, keep current floor and inventory
-    this.state.hp = Math.max(1, Math.floor(this.state.maxHp * 0.3));
+    this.state.party[0].hp = Math.max(1, Math.floor(this.state.party[0].maxHp * 0.3));
     appendMessage('💉 一阵剧痛让你重新睁开了眼！', 'event');
-    appendMessage(`❤️ HP恢复到 ${this.state.hp}/${this.state.maxHp}`, 'loot');
+    appendMessage(`❤️ HP恢复到 ${this.state.party[0].hp}/${this.state.party[0].maxHp}`, 'loot');
     updateStatusBar(this.state);
 
     if (this.state.map) {
