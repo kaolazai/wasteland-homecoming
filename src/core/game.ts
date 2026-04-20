@@ -4166,6 +4166,15 @@ export class Game {
       callback: () => {
         this.state.party[0].maxHp = this.state.maxHpBase + this.state.baseLevel.shelter * 5;
         this.state.party[0].hp = this.state.party[0].maxHp;
+        this.state.party[0].isAlive = true;
+        // Revive all party members
+        for (const m of this.state.party) {
+          if (!m.isAlive) {
+            m.isAlive = true;
+            m.hp = Math.max(1, Math.floor(m.maxHp * 0.5));
+          }
+          m.mp = m.maxMp;
+        }
         this.state.maxStamina = 100 + this.state.baseLevel.kitchen * 15;
         this.state.stamina = this.state.maxStamina;
         this.state.gold = keptGold;
@@ -4192,10 +4201,20 @@ export class Game {
   }
 
   private revive() {
-    // Revive with 30% HP, keep current floor and inventory
-    this.state.party[0].hp = Math.max(1, Math.floor(this.state.party[0].maxHp * 0.3));
+    // Revive protagonist with 30% HP
+    const p = this.state.party[0];
+    p.isAlive = true;
+    p.hp = Math.max(1, Math.floor(p.maxHp * 0.3));
     appendMessage('💉 一阵剧痛让你重新睁开了眼！', 'event');
-    appendMessage(`❤️ HP恢复到 ${this.state.party[0].hp}/${this.state.party[0].maxHp}`, 'loot');
+    appendMessage(`❤️ HP恢复到 ${p.hp}/${p.maxHp}`, 'loot');
+    // Revive other party members at 1 HP
+    for (const m of this.state.party) {
+      if (!m.isAlive) {
+        m.isAlive = true;
+        m.hp = 1;
+        appendMessage(`${m.name} 也恢复了意识 (1 HP)`, 'loot');
+      }
+    }
     updateStatusBar(this.state);
 
     if (this.state.map) {
